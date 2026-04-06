@@ -1,0 +1,21 @@
+# Build output
+build/
+install/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Benchmark results (generated)
+*.csv
+benchmarks/profiling/
+
+# Compiled objects
+*.o
+*.a
+*.so
+
+# Compile database
+compile_commands.json
