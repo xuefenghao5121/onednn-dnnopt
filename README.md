@@ -1,6 +1,6 @@
 # DNN-Opt: ARM Platform Deep Learning Optimization Library
 
-**Version: 0.3.0** (Phase 3A: Hardware-Adaptive Tuning Infrastructure)
+**Version: 0.3.1** (Phase 3B: SVE/SVE2 Full Optimization)
 
 ARM 平台高性能深度学习推理优化库，充分利用 NEON/SVE/SVE2/SME 指令集和微架构特征，在 ARM CPU 环境下实现极致推理性能。
 
@@ -33,6 +33,7 @@ ARM 平台高性能深度学习推理优化库，充分利用 NEON/SVE/SVE2/SME 
 - **Shape-Aware Blocking**: Matrix shape classification (square/tall-skinny/short-wide/BERT-like) with per-class cache utilization adjustments
 - **Multi-Precision**: FP32, BF16 (BFMMLA), INT8 (SMMLA) with transparent quantization
 - **Microkernel Registry**: Priority-based auto-dispatch (NEON=100 < SVE-128=120 < SVE-wide=200 < SME=300)
+- **SVE-128 Optimized**: Dedicated SVE-128 microkernels with predicated edge handling, software prefetch, and vectorized packing
 - **Generic BLIS Driver**: Parameterized 5-loop implementation with OpenMP threading
 
 ## Build
@@ -104,6 +105,21 @@ onednn-arm-opt/
 
 ## Development Log
 
+### v0.3.1 — Phase 3B: SVE/SVE2 Full Optimization (2026-04-07)
+
+New: SVE-128 specialized paths that activate on SVE-capable hardware.
+
+- **SVE-128 FP32 8x12 microkernel**: Same tile as NEON, uses SVE predicates for
+  edge handling, software prefetch (svprfb), 4x K-loop unroll (priority=120)
+- **SVE-128 BF16/INT8 wrappers**: NEON BFMMLA/SMMLA kernels paired with SVE packing
+  for faster data preparation (priority=120)
+- **SVE-accelerated INT8 quantization**: `svmaxv` horizontal reduction for abs-max
+  computation, replacing scalar loop in `compute_quant_scale()`
+- **SVE predicated B-panel packing**: `svwhilelt` + `svst1` for clean edge handling
+- **SVE VLA kernels preserved**: priority=200 for SVE-256+ hardware (V1, A64FX)
+
+RBSA-inspired register pipeline from autoGEMM (SC'24).
+
 ### v0.3.0 — Phase 3A: Hardware-Adaptive Tuning Infrastructure (2026-04-07)
 
 New: Hardware-adaptive GEMM framework for cross-platform portability.
@@ -155,12 +171,7 @@ Design inspired by [autoGEMM (SC'24)](https://github.com/wudu98/autoGEMM) dynami
 
 ## Roadmap
 
-### Phase 3B: SVE/SVE2 Full Optimization (Next)
-- SVE-128 specialized microkernels (beat NEON via predicates + RBSA register scrolling)
-- SVE vectorized packing (critical for INT8 quantization acceleration)
-- SVE prefetch integration with per-CPU prefetch distance tuning
-
-### Phase 3C: Advanced Multi-threading
+### Phase 3C: Advanced Multi-threading (Next)
 - M x N 2D thread decomposition (replace M-only parallelism)
 - big.LITTLE core topology awareness
 - NUMA-aware buffer allocation, huge pages
