@@ -87,7 +87,14 @@ void gemm_bf16(int M, int N, int K,
 #ifdef __ARM_NEON
     const auto& hw = detect_arm_hwcaps();
     if (hw.hwcaps & static_cast<uint64_t>(HwCap::kBF16)) {
-        gemm_driver_bf16(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        // Small-M is memory-bound (arithmetic intensity < 1 FLOP/byte).
+        // For M <= 4 (≤50% tile utilization), FP32 small-M avoids packing
+        // overhead and is faster. For M=5-7, BFMMLA's compute density wins
+        // despite partial tile utilization.
+        if (M <= kGemmMrBf16 / 2)
+            gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        else
+            gemm_driver_bf16(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
 #endif
