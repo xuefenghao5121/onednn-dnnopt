@@ -11,6 +11,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
+
 namespace dnnopt {
 
 /// Pack a block of A (m_len x k_len) into Mr-wide column panels.
@@ -83,11 +87,26 @@ void pack_b_fp32(int k_len, int n_len,
 #endif
                 packed_B += Nr;
             } else {
+                // Edge case: predicated copy + zero-pad
+#ifdef __ARM_FEATURE_SVE
+                // SVE predicated load handles edge cleanly
+                int done = 0;
+                while (done < n_rem) {
+                    svbool_t pg = svwhilelt_b32(done, n_rem);
+                    svfloat32_t v = svld1_f32(pg, src + done);
+                    svst1_f32(pg, packed_B + done, v);
+                    done += (int)svcntw();
+                }
+                for (int c = n_rem; c < Nr; ++c)
+                    packed_B[c] = 0.0f;
+#else
                 int c = 0;
                 for (; c < n_rem; ++c)
-                    *packed_B++ = src[c];
+                    packed_B[c] = src[c];
                 for (; c < Nr; ++c)
-                    *packed_B++ = 0.0f;  // zero-pad
+                    packed_B[c] = 0.0f;
+#endif
+                packed_B += Nr;
             }
         }
     }

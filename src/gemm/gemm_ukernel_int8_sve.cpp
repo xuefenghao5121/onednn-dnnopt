@@ -237,6 +237,47 @@ static const GemmMicrokernelDesc sve_int8_vla_desc = {
 
 static RegisterKernel reg_sve_int8_vla(sve_int8_vla_desc);
 
+// ============================================================
+// SVE-128 INT8: same 8x8 SMMLA tile as NEON, priority=120
+// ============================================================
+// On SVE-128, SMMLA intrinsics are identical to NEON. The benefit
+// comes from SVE-accelerated packing with vectorized quantization.
+
+// Reuse the NEON SMMLA microkernel (declared in gemm_ukernel_int8_neon.cpp)
+extern void gemm_ukernel_int8_8x8(int K, const int8_t* packed_A,
+                                    const int8_t* packed_B,
+                                    float* C, int ldc, float alpha,
+                                    float beta, float dequant_scale);
+
+static void ukernel_int8_sve128_wrap(int K, const void* packed_A,
+                                      const void* packed_B,
+                                      float* C, int ldc, float alpha,
+                                      float beta, float dequant_scale) {
+    gemm_ukernel_int8_8x8(K,
+                            static_cast<const int8_t*>(packed_A),
+                            static_cast<const int8_t*>(packed_B),
+                            C, ldc, alpha, beta, dequant_scale);
+}
+
+static const GemmMicrokernelDesc sve128_int8_desc = {
+    "sve128_int8_8x8",
+    GemmDataType::kINT8,
+    kSVE | kI8MM,             // required_hwcaps
+    8,                        // Mr
+    8,                        // Nr (fixed)
+    8,                        // Kgroup
+    false,                    // nr_is_vla: NO
+    120,                      // priority: higher than NEON 100
+    sizeof(int8_t),
+    sizeof(int8_t),
+    0,                        // min_sve_bits: any SVE
+    ukernel_int8_sve128_wrap,
+    pack_a_int8_sve_wrap,     // SVE packing (vectorized quantization)
+    pack_b_int8_sve_wrap,
+};
+
+static RegisterKernel reg_sve128_int8(sve128_int8_desc);
+
 }  // namespace dnnopt
 
 #endif  // __ARM_FEATURE_SVE && __ARM_FEATURE_SVE_MATMUL_INT8

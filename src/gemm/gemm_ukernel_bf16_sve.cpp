@@ -249,6 +249,47 @@ static const GemmMicrokernelDesc sve_bf16_vla_desc = {
 
 static RegisterKernel reg_sve_bf16_vla(sve_bf16_vla_desc);
 
+// ============================================================
+// SVE-128 BF16: same 8x8 BFMMLA tile as NEON, priority=120
+// ============================================================
+// On SVE-128, BFMMLA intrinsics are identical to NEON. The benefit
+// comes from SVE-accelerated packing (pack_a_bf16_sve/pack_b_bf16_sve)
+// which uses SVE predicates and conversion instructions.
+
+// Reuse the NEON BFMMLA microkernel (declared in gemm_ukernel_bf16_neon.cpp)
+extern void gemm_ukernel_bf16_8x8(int K, const bfloat16_t* packed_A,
+                                    const bfloat16_t* packed_B,
+                                    float* C, int ldc, float alpha, float beta);
+
+static void ukernel_bf16_sve128_wrap(int K, const void* packed_A,
+                                      const void* packed_B,
+                                      float* C, int ldc, float alpha,
+                                      float beta, float /*extra*/) {
+    gemm_ukernel_bf16_8x8(K,
+                            static_cast<const bfloat16_t*>(packed_A),
+                            static_cast<const bfloat16_t*>(packed_B),
+                            C, ldc, alpha, beta);
+}
+
+static const GemmMicrokernelDesc sve128_bf16_desc = {
+    "sve128_bf16_8x8",
+    GemmDataType::kBF16,
+    kSVE | kBF16,             // required_hwcaps
+    8,                        // Mr
+    8,                        // Nr (fixed, same as NEON)
+    4,                        // Kgroup
+    false,                    // nr_is_vla: NO
+    120,                      // priority: higher than NEON 100
+    sizeof(bfloat16_t),
+    sizeof(bfloat16_t),
+    0,                        // min_sve_bits: any SVE
+    ukernel_bf16_sve128_wrap,
+    pack_a_bf16_sve_wrap,     // SVE packing (predicated, faster)
+    pack_b_bf16_sve_wrap,
+};
+
+static RegisterKernel reg_sve128_bf16(sve128_bf16_desc);
+
 }  // namespace dnnopt
 
 #endif  // __ARM_FEATURE_SVE && __ARM_FEATURE_BF16_VECTOR_ARITHMETIC

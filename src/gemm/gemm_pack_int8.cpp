@@ -16,12 +16,33 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
+
 namespace dnnopt {
 
 #ifdef __ARM_NEON
 
 /// Compute symmetric quantization scale: scale = max(|matrix|) / 127.0f
+/// SVE-accelerated when available: uses svmaxv for fast horizontal reduction.
 static float compute_quant_scale(const float* data, int rows, int cols, int ld) {
+#ifdef __ARM_FEATURE_SVE
+    // SVE path: wider vectors + svmaxv for fast abs-max
+    svfloat32_t vmax_sve = svdup_f32(0);
+    for (int i = 0; i < rows; ++i) {
+        const float* row = data + i * ld;
+        int j = 0;
+        for (; j < cols; ) {
+            svbool_t pg = svwhilelt_b32(j, cols);
+            svfloat32_t v = svld1_f32(pg, row + j);
+            vmax_sve = svmax_f32_m(svptrue_b32(), vmax_sve, svabs_f32_x(pg, v));
+            j += (int)svcntw();
+        }
+    }
+    float amax = svmaxv_f32(svptrue_b32(), vmax_sve);
+#else
+    // NEON path
     float32x4_t vmax = vdupq_n_f32(0);
     for (int i = 0; i < rows; ++i) {
         const float* row = data + i * ld;
@@ -36,6 +57,7 @@ static float compute_quant_scale(const float* data, int rows, int cols, int ld) 
         }
     }
     float amax = vmaxvq_f32(vmax);
+#endif
     if (amax == 0.0f) return 1.0f;
     return amax / 127.0f;
 }
