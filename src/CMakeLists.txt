@@ -18,6 +18,9 @@ add_library(dnnopt_core STATIC
     gemm/gemm_ukernel_int8_neon.cpp
     gemm/gemm_driver_int8.cpp
     gemm/gemm_autotune.cpp
+    conv/conv2d.cpp
+    conv/im2col.cpp
+    conv/conv_postops.cpp
 )
 
 target_include_directories(dnnopt_core PUBLIC

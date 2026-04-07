@@ -1,9 +1,10 @@
 /// @file bench_conv.cpp
 /// Convolution benchmark suite.
-/// Tests naive im2col+GEMM and direct convolution across common shapes.
+/// Tests naive, im2col+naive-GEMM, and dnnopt::conv2d_fp32 (optimized).
 
 #include "dnnopt/aligned_alloc.h"
 #include "dnnopt/arm_hwcaps.h"
+#include "dnnopt/conv/conv.h"
 #include "dnnopt/timer.h"
 
 #include <cmath>
@@ -13,18 +14,14 @@
 #include <random>
 #include <vector>
 
-#ifdef __ARM_NEON
-#include <arm_neon.h>
-#endif
-
 namespace {
 
 // ============================================================
 // Conv2D parameters
 // ============================================================
 struct Conv2DShape {
-    int N, IC, IH, IW;       // Input: batch, channels, height, width
-    int OC, KH, KW;          // Filter: out_channels, kernel_h, kernel_w
+    int N, IC, IH, IW;
+    int OC, KH, KW;
     int stride, pad;
     const char* label;
 
@@ -58,10 +55,8 @@ const Conv2DShape conv_shapes[] = {
 // Naive NHWC Conv2D (reference)
 // ============================================================
 void conv2d_naive_nhwc(const Conv2DShape& s,
-                       const float* input,   // [N, IH, IW, IC]
-                       const float* filter,  // [OC, KH, KW, IC]
-                       const float* bias,    // [OC]
-                       float* output) {       // [N, OH, OW, OC]
+                       const float* input, const float* filter,
+                       const float* bias, float* output) {
     int OH = s.OH(), OW = s.OW();
     for (int n = 0; n < s.N; ++n) {
         for (int oh = 0; oh < OH; ++oh) {
@@ -72,8 +67,7 @@ void conv2d_naive_nhwc(const Conv2DShape& s,
                         for (int kw = 0; kw < s.KW; ++kw) {
                             int ih = oh * s.stride - s.pad + kh;
                             int iw = ow * s.stride - s.pad + kw;
-                            if (ih < 0 || ih >= s.IH || iw < 0 || iw >= s.IW)
-                                continue;
+                            if (ih < 0 || ih >= s.IH || iw < 0 || iw >= s.IW) continue;
                             for (int ic = 0; ic < s.IC; ++ic) {
                                 float in_val  = input[((n * s.IH + ih) * s.IW + iw) * s.IC + ic];
                                 float flt_val = filter[((oc * s.KH + kh) * s.KW + kw) * s.IC + ic];
@@ -91,9 +85,9 @@ void conv2d_naive_nhwc(const Conv2DShape& s,
 // ============================================================
 // im2col + naive GEMM convolution
 // ============================================================
-void im2col_nhwc(const Conv2DShape& s, const float* input, float* col) {
+void im2col_nhwc_naive(const Conv2DShape& s, const float* input, float* col) {
     int OH = s.OH(), OW = s.OW();
-    int col_w = s.IC * s.KH * s.KW;  // columns
+    int col_w = s.IC * s.KH * s.KW;
     for (int n = 0; n < s.N; ++n) {
         for (int oh = 0; oh < OH; ++oh) {
             for (int ow = 0; ow < OW; ++ow) {
@@ -117,6 +111,15 @@ void im2col_nhwc(const Conv2DShape& s, const float* input, float* col) {
             }
         }
     }
+}
+
+dnnopt::Conv2DParams to_lib_params(const Conv2DShape& s) {
+    dnnopt::Conv2DParams p;
+    p.N = s.N; p.IC = s.IC; p.IH = s.IH; p.IW = s.IW;
+    p.OC = s.OC; p.KH = s.KH; p.KW = s.KW;
+    p.stride_h = s.stride; p.stride_w = s.stride;
+    p.pad_h = s.pad; p.pad_w = s.pad;
+    return p;
 }
 
 void fill_random(float* data, size_t n) {
@@ -157,10 +160,10 @@ int main(int argc, char** argv) {
         double flops = shape.flops();
         double bytes = (in_size + flt_size + out_size) * sizeof(float);
 
-        // Naive conv (skip very large shapes)
+        // --- Naive conv (skip very large shapes) ---
         if (flops < 1e10) {
             char name[128];
-            snprintf(name, sizeof(name), "%s [%dx%dx%d→%d] naive",
+            snprintf(name, sizeof(name), "%s [%dx%dx%d->%d] naive",
                      shape.label, shape.IC, shape.IH, shape.IW, shape.OC);
             auto stats = dnnopt::benchmark(name, flops, bytes, warmup, runs, [&]() {
                 conv2d_naive_nhwc(shape, input.get(), filter.get(), nullptr, output.get());
@@ -169,23 +172,20 @@ int main(int argc, char** argv) {
             all_results.push_back(stats);
         }
 
-        // im2col version
+        // --- im2col + naive GEMM ---
         {
             size_t col_rows = (size_t)shape.N * OH * OW;
             size_t col_cols = (size_t)shape.IC * shape.KH * shape.KW;
             size_t col_size = col_rows * col_cols;
 
-            // Skip if im2col buffer too large (>512MB)
             if (col_size * sizeof(float) < 512ULL * 1024 * 1024) {
                 auto col_buf = dnnopt::aligned_array<float>(col_size);
 
                 char name[128];
-                snprintf(name, sizeof(name), "%s [%dx%dx%d→%d] im2col",
+                snprintf(name, sizeof(name), "%s [%dx%dx%d->%d] im2col+naive",
                          shape.label, shape.IC, shape.IH, shape.IW, shape.OC);
                 auto stats = dnnopt::benchmark(name, flops, bytes, warmup, runs, [&]() {
-                    im2col_nhwc(shape, input.get(), col_buf.get());
-                    // GEMM: [col_rows × col_cols] × [col_cols × OC] → [col_rows × OC]
-                    // (naive GEMM for reference)
+                    im2col_nhwc_naive(shape, input.get(), col_buf.get());
                     for (size_t i = 0; i < col_rows; ++i) {
                         for (int oc = 0; oc < shape.OC; ++oc) {
                             float acc = 0.0f;
@@ -200,6 +200,20 @@ int main(int argc, char** argv) {
                 dnnopt::print_bench_stats(stats);
                 all_results.push_back(stats);
             }
+        }
+
+        // --- dnnopt::conv2d_fp32 (optimized im2col + GEMM) ---
+        {
+            auto lp = to_lib_params(shape);
+            char name[128];
+            snprintf(name, sizeof(name), "%s [%dx%dx%d->%d] dnnopt",
+                     shape.label, shape.IC, shape.IH, shape.IW, shape.OC);
+            auto stats = dnnopt::benchmark(name, flops, bytes, warmup, runs, [&]() {
+                dnnopt::conv2d_fp32(lp, input.get(), filter.get(), nullptr,
+                                    output.get(), dnnopt::ConvPostOp::kNone);
+            });
+            dnnopt::print_bench_stats(stats);
+            all_results.push_back(stats);
         }
 
         printf("\n");
