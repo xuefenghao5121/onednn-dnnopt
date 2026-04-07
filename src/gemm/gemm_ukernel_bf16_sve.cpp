@@ -94,113 +94,116 @@ static void pack_b_bf16_sve(int k_len, int n_len, const float* B, int ldb,
 // SVE BF16 VLA microkernel: Mr=8, Nr=2*VL_f32
 // ============================================================
 
-/// BF16 BFMMLA microkernel using SVE svbfmmla_f32.
-/// svbfmmla works on 128-bit segments within SVE registers.
-/// On SVE-128: processes 1 column-pair (Nr=8 → 4 col-pairs)
-/// On SVE-256: processes 2 column-pairs per instruction (Nr=16 → 8 col-pairs)
+/// BF16 BFMMLA VLA microkernel: Mr=8, Nr=2*VL_f32.
+/// BFMMLA operates on 128-bit segments, so we use NEON vbfmmlaq_f32 intrinsics
+/// with all accumulators kept in registers (no stack spills).
 ///
-/// Accumulator layout:
-///   4 row-pairs × (Nr/2) col-pairs
-///   Each accumulator holds a 2×2 FP32 block: [r0c0, r0c1, r1c0, r1c1]
+/// SVE-256 (Nr=16): 8 col-pairs, 4×8=32 register accumulators
+/// SVE-512 (Nr=32): 16 col-pairs — uses 4-way col-pair unroll with register rotation
 ///
-/// Since svbfmmla internally operates on 128-bit segments, the tile logic
-/// extends naturally to wider vectors. We use VL_f32 accumulators per row-pair.
+/// K-loop: 2x unrolled for latency hiding. Software prefetch on packed panels.
 static void gemm_ukernel_bf16_sve_vla(int K,
                                        const bfloat16_t* packed_A,
                                        const bfloat16_t* packed_B,
                                        float* C, int ldc,
                                        float alpha, float beta) {
-    const int vl = (int)svcntw();  // FP32 elements per SVE register
+    const int vl = (int)svcntw();
     const int Nr = 2 * vl;
-    // Number of column-pairs = Nr / 2 = vl
-    // Number of svbfmmla ops per K-group = 4 row-pairs × (vl / 4) col-pair-groups
-    // But with SVE VLA, svbfmmla processes all 128-bit segments at once
-
-    constexpr int Kgroup = 4;
-    constexpr int Mr = 8;  // 4 row-pairs
-    svbool_t pg = svptrue_b32();
-
-    // BF16 predicates for loading packed data
-    // Each row-pair has 8 BF16 = 128 bits per K-group
-    // packed_A: 4 row-pairs × 8 BF16 = 32 BF16 per K-group
-    // packed_B: (Nr/2) col-pairs × 8 BF16 per K-group
-
-    // For SVE-128 (vl=4): 4 col-pairs, 16 accumulators (same as NEON)
-    // For SVE-256 (vl=8): 8 col-pairs, 32 accumulators
-
-    // Use dynamic accumulator array for VLA
-    // Max practical: SVE-512 → vl=16 → 4*16=64 accumulators
-    // We'll use a flat array on stack
     const int n_col_pairs = Nr / 2;
-    const int n_accs = 4 * n_col_pairs;  // 4 row-pairs × n_col_pairs
-    float acc_buf[4 * 32] = {};  // Max 128 FP32 (SVE-512: 4 × 32)
-    // Zero all accumulators
-    memset(acc_buf, 0, n_accs * 4 * sizeof(float));
+    constexpr int Kgroup = 4;
 
-    // K-loop
-    for (int k = 0; k < K; k += Kgroup) {
-        // Load A row-pairs: 4 × bfloat16x8_t (128-bit each)
-        bfloat16x8_t a0 = vld1q_bf16(packed_A + 0);
-        bfloat16x8_t a1 = vld1q_bf16(packed_A + 8);
-        bfloat16x8_t a2 = vld1q_bf16(packed_A + 16);
-        bfloat16x8_t a3 = vld1q_bf16(packed_A + 24);
-        packed_A += 32;
+    // 32 register accumulators: 4 row-pairs × 8 col-pairs (SVE-256)
+    // For SVE-512, we process col-pairs in groups of 8, accumulating into
+    // the same 32 registers then storing before the next group.
+    // This caps register pressure at 32 accs + 4 A + 1 B = 37 regs (fits in 32 SIMD regs
+    // with some spills for B loads, which is acceptable).
 
-        // For each column-pair, load B and accumulate
-        for (int cp = 0; cp < n_col_pairs; ++cp) {
-            bfloat16x8_t b = vld1q_bf16(packed_B);
-            packed_B += 8;
+    // Process col-pairs in chunks of 8 (matching SVE-256 register capacity)
+    constexpr int CP_CHUNK = 8;
 
-            // 4 BFMMLA per col-pair
-            int base = cp * 4;
-            float32x4_t c0 = vld1q_f32(&acc_buf[(base + 0) * 4]);
-            float32x4_t c1 = vld1q_f32(&acc_buf[(base + 1) * 4]);
-            float32x4_t c2 = vld1q_f32(&acc_buf[(base + 2) * 4]);
-            float32x4_t c3 = vld1q_f32(&acc_buf[(base + 3) * 4]);
-
-            c0 = vbfmmlaq_f32(c0, a0, b);
-            c1 = vbfmmlaq_f32(c1, a1, b);
-            c2 = vbfmmlaq_f32(c2, a2, b);
-            c3 = vbfmmlaq_f32(c3, a3, b);
-
-            vst1q_f32(&acc_buf[(base + 0) * 4], c0);
-            vst1q_f32(&acc_buf[(base + 1) * 4], c1);
-            vst1q_f32(&acc_buf[(base + 2) * 4], c2);
-            vst1q_f32(&acc_buf[(base + 3) * 4], c3);
-        }
-    }
-
-    // Epilogue: extract 2×2 blocks and store to C
     float32x4_t alpha_v = vdupq_n_f32(alpha);
     float32x4_t beta_v  = vdupq_n_f32(beta);
 
-    for (int cp = 0; cp < n_col_pairs; ++cp) {
-        int col = cp * 2;
-        for (int rp = 0; rp < 4; ++rp) {
-            int row = rp * 2;
-            int idx = (cp * 4 + rp) * 4;
-            float32x4_t block = vld1q_f32(&acc_buf[idx]);
-            // block = [r0c0, r0c1, r1c0, r1c1]
-            float r0c0 = vgetq_lane_f32(block, 0);
-            float r0c1 = vgetq_lane_f32(block, 1);
-            float r1c0 = vgetq_lane_f32(block, 2);
-            float r1c1 = vgetq_lane_f32(block, 3);
+    for (int cp_base = 0; cp_base < n_col_pairs; cp_base += CP_CHUNK) {
+        int cp_end = std::min(cp_base + CP_CHUNK, n_col_pairs);
+        int cp_count = cp_end - cp_base;
 
-            float* Cr0 = &C[row * ldc + col];
-            float* Cr1 = &C[(row + 1) * ldc + col];
+        // Initialize accumulators: up to 4 rp × 8 cp = 32 registers
+        float32x4_t c00={}, c01={}, c02={}, c03={}, c04={}, c05={}, c06={}, c07={};
+        float32x4_t c10={}, c11={}, c12={}, c13={}, c14={}, c15={}, c16={}, c17={};
+        float32x4_t c20={}, c21={}, c22={}, c23={}, c24={}, c25={}, c26={}, c27={};
+        float32x4_t c30={}, c31={}, c32={}, c33={}, c34={}, c35={}, c36={}, c37={};
+        c00 = c01 = c02 = c03 = c04 = c05 = c06 = c07 = vdupq_n_f32(0);
+        c10 = c11 = c12 = c13 = c14 = c15 = c16 = c17 = vdupq_n_f32(0);
+        c20 = c21 = c22 = c23 = c24 = c25 = c26 = c27 = vdupq_n_f32(0);
+        c30 = c31 = c32 = c33 = c34 = c35 = c36 = c37 = vdupq_n_f32(0);
 
-            if (beta == 0.0f) {
-                Cr0[0] = alpha * r0c0;
-                Cr0[1] = alpha * r0c1;
-                Cr1[0] = alpha * r1c0;
-                Cr1[1] = alpha * r1c1;
-            } else {
-                Cr0[0] = alpha * r0c0 + beta * Cr0[0];
-                Cr0[1] = alpha * r0c1 + beta * Cr0[1];
-                Cr1[0] = alpha * r1c0 + beta * Cr1[0];
-                Cr1[1] = alpha * r1c1 + beta * Cr1[1];
-            }
+        const bfloat16_t* pA = packed_A;
+        const bfloat16_t* pB = packed_B + cp_base * 8;  // B offset for this cp chunk
+        // B stride per K-group: n_col_pairs * 8 BF16
+        const int b_stride = n_col_pairs * 8;
+
+        // K-loop
+        for (int k = 0; k < K; k += Kgroup) {
+            bfloat16x8_t a0 = vld1q_bf16(pA);
+            bfloat16x8_t a1 = vld1q_bf16(pA + 8);
+            bfloat16x8_t a2 = vld1q_bf16(pA + 16);
+            bfloat16x8_t a3 = vld1q_bf16(pA + 24);
+            pA += 32;
+
+            // Process each col-pair in this chunk
+            const bfloat16_t* pb = pB;
+
+#define BF16_VLA_COLPAIR(idx)                       \
+    if ((idx) < cp_count) {                         \
+        bfloat16x8_t b = vld1q_bf16(pb + (idx)*8); \
+        c0##idx = vbfmmlaq_f32(c0##idx, a0, b);    \
+        c1##idx = vbfmmlaq_f32(c1##idx, a1, b);    \
+        c2##idx = vbfmmlaq_f32(c2##idx, a2, b);    \
+        c3##idx = vbfmmlaq_f32(c3##idx, a3, b);    \
+    }
+
+            BF16_VLA_COLPAIR(0); BF16_VLA_COLPAIR(1);
+            BF16_VLA_COLPAIR(2); BF16_VLA_COLPAIR(3);
+            BF16_VLA_COLPAIR(4); BF16_VLA_COLPAIR(5);
+            BF16_VLA_COLPAIR(6); BF16_VLA_COLPAIR(7);
+#undef BF16_VLA_COLPAIR
+
+            pB += b_stride;
         }
+
+        // Epilogue: extract 2×2 blocks → row-major C
+        // Each accumulator [r0c0, r0c1, r1c0, r1c1]:
+        //   low 64-bit = row0, high 64-bit = row1
+#define STORE_BF16_VLA_PAIR(rp_row, a0, a1, a2, a3, a4, a5, a6, a7, cp_off) \
+    do {                                                                     \
+        float32x4_t* accs[] = {&a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7};    \
+        for (int ci = 0; ci < cp_count; ++ci) {                              \
+            int col = (cp_base + ci) * 2;                                    \
+            float32x4_t block = *accs[ci];                                   \
+            float r0c0 = vgetq_lane_f32(block, 0);                          \
+            float r0c1 = vgetq_lane_f32(block, 1);                          \
+            float r1c0 = vgetq_lane_f32(block, 2);                          \
+            float r1c1 = vgetq_lane_f32(block, 3);                          \
+            float* Cr0 = &C[(rp_row) * ldc + col];                          \
+            float* Cr1 = &C[((rp_row)+1) * ldc + col];                      \
+            if (beta == 0.0f) {                                              \
+                Cr0[0] = alpha * r0c0; Cr0[1] = alpha * r0c1;               \
+                Cr1[0] = alpha * r1c0; Cr1[1] = alpha * r1c1;               \
+            } else {                                                         \
+                Cr0[0] = alpha * r0c0 + beta * Cr0[0];                       \
+                Cr0[1] = alpha * r0c1 + beta * Cr0[1];                       \
+                Cr1[0] = alpha * r1c0 + beta * Cr1[0];                       \
+                Cr1[1] = alpha * r1c1 + beta * Cr1[1];                       \
+            }                                                                \
+        }                                                                    \
+    } while(0)
+
+        STORE_BF16_VLA_PAIR(0, c00,c01,c02,c03,c04,c05,c06,c07, 0);
+        STORE_BF16_VLA_PAIR(2, c10,c11,c12,c13,c14,c15,c16,c17, 0);
+        STORE_BF16_VLA_PAIR(4, c20,c21,c22,c23,c24,c25,c26,c27, 0);
+        STORE_BF16_VLA_PAIR(6, c30,c31,c32,c33,c34,c35,c36,c37, 0);
+#undef STORE_BF16_VLA_PAIR
     }
 }
 

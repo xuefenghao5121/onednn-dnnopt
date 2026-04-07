@@ -84,9 +84,14 @@ static void pack_b_fp32_sve_wrap(int k_len, int n_len, const float* B, int ldb,
 // SVE FP32 VLA microkernel: Mr=8, Nr=2*svcntw()
 // ============================================================
 
-/// VLA microkernel: works for any SVE vector length.
+/// VLA microkernel: works for any SVE vector length >= 256-bit.
 /// Uses Mr=8 rows and Nr=2*VL columns (2 SVE registers per row).
 /// 16 accumulator registers: 8 rows × 2 B-vectors.
+///
+/// On SVE-256: Nr=16, each FMLA processes 8 floats → 256 FLOP/K-iter
+/// On SVE-512: Nr=32, each FMLA processes 16 floats → 512 FLOP/K-iter
+///
+/// K-loop: 4x unroll with software prefetch for wide SVE.
 static void gemm_ukernel_fp32_sve_vla(int K,
                                        const float* packed_A,
                                        const float* packed_B,
@@ -106,72 +111,63 @@ static void gemm_ukernel_fp32_sve_vla(int K,
     svfloat32_t acc6_0 = svdup_f32(0), acc6_1 = svdup_f32(0);
     svfloat32_t acc7_0 = svdup_f32(0), acc7_1 = svdup_f32(0);
 
-    // K-loop: 2x unroll for better instruction scheduling
+    // K-loop: 4x unroll for better amortization of load latency on wide SVE
+    constexpr int PREFETCH_DIST = 12;  // wider SVE → deeper prefetch
     int k = 0;
-    for (; k + 1 < K; k += 2) {
-        // Iteration 0
-        svfloat32_t b0_0 = svld1_f32(pg, packed_B + k * Nr);
-        svfloat32_t b0_1 = svld1_f32(pg, packed_B + k * Nr + vl);
+    for (; k + 3 < K; k += 4) {
+        // Prefetch A and B panels ahead
+        if (k + PREFETCH_DIST < K) {
+            svprfb(pg, packed_A + (k + PREFETCH_DIST) * 8, SV_PLDL1KEEP);
+            svprfb(pg, packed_B + (k + PREFETCH_DIST) * Nr, SV_PLDL1KEEP);
+            svprfb(pg, packed_B + (k + PREFETCH_DIST) * Nr + vl, SV_PLDL1KEEP);
+        }
 
-        acc0_0 = svmla_f32_x(pg, acc0_0, b0_0, svdup_f32(packed_A[k * 8 + 0]));
-        acc0_1 = svmla_f32_x(pg, acc0_1, b0_1, svdup_f32(packed_A[k * 8 + 0]));
-        acc1_0 = svmla_f32_x(pg, acc1_0, b0_0, svdup_f32(packed_A[k * 8 + 1]));
-        acc1_1 = svmla_f32_x(pg, acc1_1, b0_1, svdup_f32(packed_A[k * 8 + 1]));
-        acc2_0 = svmla_f32_x(pg, acc2_0, b0_0, svdup_f32(packed_A[k * 8 + 2]));
-        acc2_1 = svmla_f32_x(pg, acc2_1, b0_1, svdup_f32(packed_A[k * 8 + 2]));
-        acc3_0 = svmla_f32_x(pg, acc3_0, b0_0, svdup_f32(packed_A[k * 8 + 3]));
-        acc3_1 = svmla_f32_x(pg, acc3_1, b0_1, svdup_f32(packed_A[k * 8 + 3]));
-        acc4_0 = svmla_f32_x(pg, acc4_0, b0_0, svdup_f32(packed_A[k * 8 + 4]));
-        acc4_1 = svmla_f32_x(pg, acc4_1, b0_1, svdup_f32(packed_A[k * 8 + 4]));
-        acc5_0 = svmla_f32_x(pg, acc5_0, b0_0, svdup_f32(packed_A[k * 8 + 5]));
-        acc5_1 = svmla_f32_x(pg, acc5_1, b0_1, svdup_f32(packed_A[k * 8 + 5]));
-        acc6_0 = svmla_f32_x(pg, acc6_0, b0_0, svdup_f32(packed_A[k * 8 + 6]));
-        acc6_1 = svmla_f32_x(pg, acc6_1, b0_1, svdup_f32(packed_A[k * 8 + 6]));
-        acc7_0 = svmla_f32_x(pg, acc7_0, b0_0, svdup_f32(packed_A[k * 8 + 7]));
-        acc7_1 = svmla_f32_x(pg, acc7_1, b0_1, svdup_f32(packed_A[k * 8 + 7]));
+#define SVE_VLA_KITER(kidx)                                                     \
+        do {                                                                    \
+            svfloat32_t b0 = svld1_f32(pg, packed_B + (kidx) * Nr);            \
+            svfloat32_t b1 = svld1_f32(pg, packed_B + (kidx) * Nr + vl);       \
+            acc0_0 = svmla_f32_x(pg, acc0_0, b0, svdup_f32(packed_A[(kidx)*8+0])); \
+            acc0_1 = svmla_f32_x(pg, acc0_1, b1, svdup_f32(packed_A[(kidx)*8+0])); \
+            acc1_0 = svmla_f32_x(pg, acc1_0, b0, svdup_f32(packed_A[(kidx)*8+1])); \
+            acc1_1 = svmla_f32_x(pg, acc1_1, b1, svdup_f32(packed_A[(kidx)*8+1])); \
+            acc2_0 = svmla_f32_x(pg, acc2_0, b0, svdup_f32(packed_A[(kidx)*8+2])); \
+            acc2_1 = svmla_f32_x(pg, acc2_1, b1, svdup_f32(packed_A[(kidx)*8+2])); \
+            acc3_0 = svmla_f32_x(pg, acc3_0, b0, svdup_f32(packed_A[(kidx)*8+3])); \
+            acc3_1 = svmla_f32_x(pg, acc3_1, b1, svdup_f32(packed_A[(kidx)*8+3])); \
+            acc4_0 = svmla_f32_x(pg, acc4_0, b0, svdup_f32(packed_A[(kidx)*8+4])); \
+            acc4_1 = svmla_f32_x(pg, acc4_1, b1, svdup_f32(packed_A[(kidx)*8+4])); \
+            acc5_0 = svmla_f32_x(pg, acc5_0, b0, svdup_f32(packed_A[(kidx)*8+5])); \
+            acc5_1 = svmla_f32_x(pg, acc5_1, b1, svdup_f32(packed_A[(kidx)*8+5])); \
+            acc6_0 = svmla_f32_x(pg, acc6_0, b0, svdup_f32(packed_A[(kidx)*8+6])); \
+            acc6_1 = svmla_f32_x(pg, acc6_1, b1, svdup_f32(packed_A[(kidx)*8+6])); \
+            acc7_0 = svmla_f32_x(pg, acc7_0, b0, svdup_f32(packed_A[(kidx)*8+7])); \
+            acc7_1 = svmla_f32_x(pg, acc7_1, b1, svdup_f32(packed_A[(kidx)*8+7])); \
+        } while (0)
 
-        // Iteration 1
-        svfloat32_t b1_0 = svld1_f32(pg, packed_B + (k + 1) * Nr);
-        svfloat32_t b1_1 = svld1_f32(pg, packed_B + (k + 1) * Nr + vl);
-
-        acc0_0 = svmla_f32_x(pg, acc0_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 0]));
-        acc0_1 = svmla_f32_x(pg, acc0_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 0]));
-        acc1_0 = svmla_f32_x(pg, acc1_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 1]));
-        acc1_1 = svmla_f32_x(pg, acc1_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 1]));
-        acc2_0 = svmla_f32_x(pg, acc2_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 2]));
-        acc2_1 = svmla_f32_x(pg, acc2_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 2]));
-        acc3_0 = svmla_f32_x(pg, acc3_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 3]));
-        acc3_1 = svmla_f32_x(pg, acc3_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 3]));
-        acc4_0 = svmla_f32_x(pg, acc4_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 4]));
-        acc4_1 = svmla_f32_x(pg, acc4_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 4]));
-        acc5_0 = svmla_f32_x(pg, acc5_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 5]));
-        acc5_1 = svmla_f32_x(pg, acc5_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 5]));
-        acc6_0 = svmla_f32_x(pg, acc6_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 6]));
-        acc6_1 = svmla_f32_x(pg, acc6_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 6]));
-        acc7_0 = svmla_f32_x(pg, acc7_0, b1_0, svdup_f32(packed_A[(k + 1) * 8 + 7]));
-        acc7_1 = svmla_f32_x(pg, acc7_1, b1_1, svdup_f32(packed_A[(k + 1) * 8 + 7]));
+        SVE_VLA_KITER(k + 0);
+        SVE_VLA_KITER(k + 1);
+        SVE_VLA_KITER(k + 2);
+        SVE_VLA_KITER(k + 3);
+#undef SVE_VLA_KITER
     }
-    // Handle odd K
+    // Handle remaining K
     for (; k < K; ++k) {
         svfloat32_t b0 = svld1_f32(pg, packed_B + k * Nr);
         svfloat32_t b1 = svld1_f32(pg, packed_B + k * Nr + vl);
 
-        acc0_0 = svmla_f32_x(pg, acc0_0, b0, svdup_f32(packed_A[k * 8 + 0]));
-        acc0_1 = svmla_f32_x(pg, acc0_1, b1, svdup_f32(packed_A[k * 8 + 0]));
-        acc1_0 = svmla_f32_x(pg, acc1_0, b0, svdup_f32(packed_A[k * 8 + 1]));
-        acc1_1 = svmla_f32_x(pg, acc1_1, b1, svdup_f32(packed_A[k * 8 + 1]));
-        acc2_0 = svmla_f32_x(pg, acc2_0, b0, svdup_f32(packed_A[k * 8 + 2]));
-        acc2_1 = svmla_f32_x(pg, acc2_1, b1, svdup_f32(packed_A[k * 8 + 2]));
-        acc3_0 = svmla_f32_x(pg, acc3_0, b0, svdup_f32(packed_A[k * 8 + 3]));
-        acc3_1 = svmla_f32_x(pg, acc3_1, b1, svdup_f32(packed_A[k * 8 + 3]));
-        acc4_0 = svmla_f32_x(pg, acc4_0, b0, svdup_f32(packed_A[k * 8 + 4]));
-        acc4_1 = svmla_f32_x(pg, acc4_1, b1, svdup_f32(packed_A[k * 8 + 4]));
-        acc5_0 = svmla_f32_x(pg, acc5_0, b0, svdup_f32(packed_A[k * 8 + 5]));
-        acc5_1 = svmla_f32_x(pg, acc5_1, b1, svdup_f32(packed_A[k * 8 + 5]));
-        acc6_0 = svmla_f32_x(pg, acc6_0, b0, svdup_f32(packed_A[k * 8 + 6]));
-        acc6_1 = svmla_f32_x(pg, acc6_1, b1, svdup_f32(packed_A[k * 8 + 6]));
-        acc7_0 = svmla_f32_x(pg, acc7_0, b0, svdup_f32(packed_A[k * 8 + 7]));
-        acc7_1 = svmla_f32_x(pg, acc7_1, b1, svdup_f32(packed_A[k * 8 + 7]));
+#define SVE_VLA_FMA(row, a0, a1)                                    \
+        a0 = svmla_f32_x(pg, a0, b0, svdup_f32(packed_A[k*8+row]));  \
+        a1 = svmla_f32_x(pg, a1, b1, svdup_f32(packed_A[k*8+row]))
+
+        SVE_VLA_FMA(0, acc0_0, acc0_1);
+        SVE_VLA_FMA(1, acc1_0, acc1_1);
+        SVE_VLA_FMA(2, acc2_0, acc2_1);
+        SVE_VLA_FMA(3, acc3_0, acc3_1);
+        SVE_VLA_FMA(4, acc4_0, acc4_1);
+        SVE_VLA_FMA(5, acc5_0, acc5_1);
+        SVE_VLA_FMA(6, acc6_0, acc6_1);
+        SVE_VLA_FMA(7, acc7_0, acc7_1);
+#undef SVE_VLA_FMA
     }
 
     // Epilogue: C = alpha * acc + beta * C

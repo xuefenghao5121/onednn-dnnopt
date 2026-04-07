@@ -24,20 +24,19 @@ namespace dnnopt {
 // ============================================================
 
 static float compute_quant_scale_sve(const float* data, int rows, int cols, int ld) {
-    float32x4_t vmax = vdupq_n_f32(0);
+    // SVE path: wider vectors + svmaxv for fast horizontal reduction
+    svfloat32_t vmax_sve = svdup_f32(0);
     for (int i = 0; i < rows; ++i) {
         const float* row = data + i * ld;
         int j = 0;
-        for (; j + 3 < cols; j += 4) {
-            float32x4_t v = vld1q_f32(row + j);
-            vmax = vmaxq_f32(vmax, vabsq_f32(v));
-        }
-        for (; j < cols; ++j) {
-            float av = std::fabs(row[j]);
-            vmax = vmaxq_f32(vmax, vdupq_n_f32(av));
+        for (; j < cols; ) {
+            svbool_t pg = svwhilelt_b32(j, cols);
+            svfloat32_t v = svld1_f32(pg, row + j);
+            vmax_sve = svmax_f32_m(svptrue_b32(), vmax_sve, svabs_f32_x(pg, v));
+            j += (int)svcntw();
         }
     }
-    float amax = vmaxvq_f32(vmax);
+    float amax = svmaxv_f32(svptrue_b32(), vmax_sve);
     if (amax == 0.0f) return 1.0f;
     return amax / 127.0f;
 }
@@ -111,85 +110,106 @@ static void pack_b_int8_sve(int k_len, int n_len, const float* B, int ldb,
 // SVE INT8 VLA microkernel
 // ============================================================
 
+/// INT8 SMMLA VLA microkernel: Mr=8, Nr=2*VL_f32.
+/// SMMLA operates on 128-bit segments, so we use NEON vmmlaq_s32 intrinsics
+/// with all accumulators kept in registers (no stack spills).
+///
+/// SVE-256 (Nr=16): 8 col-pairs, 4×8=32 register accumulators
+/// SVE-512 (Nr=32): 16 col-pairs — uses 8-way col-pair chunks
+///
+/// K-loop processes Kgroup=8 INT8 elements per iteration.
 static void gemm_ukernel_int8_sve_vla(int K,
                                        const int8_t* packed_A,
                                        const int8_t* packed_B,
                                        float* C, int ldc,
                                        float alpha, float beta,
                                        float dequant_scale) {
-    const int vl = (int)svcntw();  // FP32 elements per SVE reg
+    const int vl = (int)svcntw();
     const int Nr = 2 * vl;
-    constexpr int Kgroup = 8;
-    constexpr int Mr = 8;
     const int n_col_pairs = Nr / 2;
-    const int n_accs = 4 * n_col_pairs;
+    constexpr int Kgroup = 8;
 
-    // Dynamic accumulator buffer
-    int32_t acc_buf[4 * 32 * 4] = {};  // Max SVE-512: 4 rp × 32 cp × 4 elements
-    memset(acc_buf, 0, n_accs * 4 * sizeof(int32_t));
-
-    // K-loop
-    for (int k = 0; k < K; k += Kgroup) {
-        // Load A row-pairs: 4 × int8x16_t (128-bit each, 2×8 INT8)
-        int8x16_t a0 = vld1q_s8(packed_A + 0);
-        int8x16_t a1 = vld1q_s8(packed_A + 16);
-        int8x16_t a2 = vld1q_s8(packed_A + 32);
-        int8x16_t a3 = vld1q_s8(packed_A + 48);
-        packed_A += 64;
-
-        for (int cp = 0; cp < n_col_pairs; ++cp) {
-            int8x16_t b = vld1q_s8(packed_B);
-            packed_B += 16;
-
-            int base = cp * 4;
-            int32x4_t c0 = vld1q_s32(&acc_buf[(base + 0) * 4]);
-            int32x4_t c1 = vld1q_s32(&acc_buf[(base + 1) * 4]);
-            int32x4_t c2 = vld1q_s32(&acc_buf[(base + 2) * 4]);
-            int32x4_t c3 = vld1q_s32(&acc_buf[(base + 3) * 4]);
-
-            c0 = vmmlaq_s32(c0, a0, b);
-            c1 = vmmlaq_s32(c1, a1, b);
-            c2 = vmmlaq_s32(c2, a2, b);
-            c3 = vmmlaq_s32(c3, a3, b);
-
-            vst1q_s32(&acc_buf[(base + 0) * 4], c0);
-            vst1q_s32(&acc_buf[(base + 1) * 4], c1);
-            vst1q_s32(&acc_buf[(base + 2) * 4], c2);
-            vst1q_s32(&acc_buf[(base + 3) * 4], c3);
-        }
-    }
-
-    // Epilogue: INT32 → FP32, scale, store
+    // Process col-pairs in chunks of 8 to cap register pressure
+    constexpr int CP_CHUNK = 8;
     float scale = dequant_scale * alpha;
 
-    for (int cp = 0; cp < n_col_pairs; ++cp) {
-        int col = cp * 2;
-        for (int rp = 0; rp < 4; ++rp) {
-            int row = rp * 2;
-            int idx = (cp * 4 + rp) * 4;
-            int32x4_t block_i = vld1q_s32(&acc_buf[idx]);
-            float32x4_t block_f = vcvtq_f32_s32(block_i);
-            float32x4_t scale_v = vdupq_n_f32(scale);
-            block_f = vmulq_f32(block_f, scale_v);
+    for (int cp_base = 0; cp_base < n_col_pairs; cp_base += CP_CHUNK) {
+        int cp_end = std::min(cp_base + CP_CHUNK, n_col_pairs);
+        int cp_count = cp_end - cp_base;
 
-            float r0c0 = vgetq_lane_f32(block_f, 0);
-            float r0c1 = vgetq_lane_f32(block_f, 1);
-            float r1c0 = vgetq_lane_f32(block_f, 2);
-            float r1c1 = vgetq_lane_f32(block_f, 3);
+        // 32 INT32 accumulators: 4 row-pairs × up to 8 col-pairs
+        int32x4_t c00={}, c01={}, c02={}, c03={}, c04={}, c05={}, c06={}, c07={};
+        int32x4_t c10={}, c11={}, c12={}, c13={}, c14={}, c15={}, c16={}, c17={};
+        int32x4_t c20={}, c21={}, c22={}, c23={}, c24={}, c25={}, c26={}, c27={};
+        int32x4_t c30={}, c31={}, c32={}, c33={}, c34={}, c35={}, c36={}, c37={};
+        c00 = c01 = c02 = c03 = c04 = c05 = c06 = c07 = vdupq_n_s32(0);
+        c10 = c11 = c12 = c13 = c14 = c15 = c16 = c17 = vdupq_n_s32(0);
+        c20 = c21 = c22 = c23 = c24 = c25 = c26 = c27 = vdupq_n_s32(0);
+        c30 = c31 = c32 = c33 = c34 = c35 = c36 = c37 = vdupq_n_s32(0);
 
-            float* Cr0 = &C[row * ldc + col];
-            float* Cr1 = &C[(row + 1) * ldc + col];
+        const int8_t* pA = packed_A;
+        const int8_t* pB = packed_B + cp_base * 16;  // 16 bytes per col-pair
+        const int b_stride = n_col_pairs * 16;  // B stride per K-group
 
-            if (beta == 0.0f) {
-                Cr0[0] = r0c0;  Cr0[1] = r0c1;
-                Cr1[0] = r1c0;  Cr1[1] = r1c1;
-            } else {
-                Cr0[0] = r0c0 + beta * Cr0[0];
-                Cr0[1] = r0c1 + beta * Cr0[1];
-                Cr1[0] = r1c0 + beta * Cr1[0];
-                Cr1[1] = r1c1 + beta * Cr1[1];
-            }
+        // K-loop
+        for (int k = 0; k < K; k += Kgroup) {
+            int8x16_t a0 = vld1q_s8(pA);
+            int8x16_t a1 = vld1q_s8(pA + 16);
+            int8x16_t a2 = vld1q_s8(pA + 32);
+            int8x16_t a3 = vld1q_s8(pA + 48);
+            pA += 64;
+
+            const int8_t* pb = pB;
+
+#define INT8_VLA_COLPAIR(idx)                       \
+    if ((idx) < cp_count) {                         \
+        int8x16_t b = vld1q_s8(pb + (idx)*16);     \
+        c0##idx = vmmlaq_s32(c0##idx, a0, b);       \
+        c1##idx = vmmlaq_s32(c1##idx, a1, b);       \
+        c2##idx = vmmlaq_s32(c2##idx, a2, b);       \
+        c3##idx = vmmlaq_s32(c3##idx, a3, b);       \
+    }
+
+            INT8_VLA_COLPAIR(0); INT8_VLA_COLPAIR(1);
+            INT8_VLA_COLPAIR(2); INT8_VLA_COLPAIR(3);
+            INT8_VLA_COLPAIR(4); INT8_VLA_COLPAIR(5);
+            INT8_VLA_COLPAIR(6); INT8_VLA_COLPAIR(7);
+#undef INT8_VLA_COLPAIR
+
+            pB += b_stride;
         }
+
+        // Epilogue: INT32 → FP32, scale, store
+#define STORE_INT8_VLA_PAIR(rp_row, a0, a1, a2, a3, a4, a5, a6, a7) \
+    do {                                                              \
+        int32x4_t* accs[] = {&a0, &a1, &a2, &a3, &a4, &a5, &a6, &a7}; \
+        for (int ci = 0; ci < cp_count; ++ci) {                       \
+            int col = (cp_base + ci) * 2;                             \
+            int32x4_t block_i = *accs[ci];                            \
+            float32x4_t block_f = vcvtq_f32_s32(block_i);            \
+            float r0c0 = scale * vgetq_lane_f32(block_f, 0);         \
+            float r0c1 = scale * vgetq_lane_f32(block_f, 1);         \
+            float r1c0 = scale * vgetq_lane_f32(block_f, 2);         \
+            float r1c1 = scale * vgetq_lane_f32(block_f, 3);         \
+            float* Cr0 = &C[(rp_row) * ldc + col];                   \
+            float* Cr1 = &C[((rp_row)+1) * ldc + col];               \
+            if (beta == 0.0f) {                                       \
+                Cr0[0] = r0c0; Cr0[1] = r0c1;                        \
+                Cr1[0] = r1c0; Cr1[1] = r1c1;                        \
+            } else {                                                  \
+                Cr0[0] = r0c0 + beta * Cr0[0];                        \
+                Cr0[1] = r0c1 + beta * Cr0[1];                        \
+                Cr1[0] = r1c0 + beta * Cr1[0];                        \
+                Cr1[1] = r1c1 + beta * Cr1[1];                        \
+            }                                                         \
+        }                                                             \
+    } while(0)
+
+        STORE_INT8_VLA_PAIR(0, c00,c01,c02,c03,c04,c05,c06,c07);
+        STORE_INT8_VLA_PAIR(2, c10,c11,c12,c13,c14,c15,c16,c17);
+        STORE_INT8_VLA_PAIR(4, c20,c21,c22,c23,c24,c25,c26,c27);
+        STORE_INT8_VLA_PAIR(6, c30,c31,c32,c33,c34,c35,c36,c37);
+#undef STORE_INT8_VLA_PAIR
     }
 }
 

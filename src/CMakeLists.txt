@@ -83,6 +83,8 @@ if(DNNOPT_ENABLE_SME)
         message(STATUS "SME support: YES (compile-only, needs SME hardware to run)")
         target_sources(dnnopt_core PRIVATE
             gemm/gemm_ukernel_fp32_sme.cpp
+            gemm/gemm_ukernel_bf16_sme.cpp
+            gemm/gemm_ukernel_int8_sme.cpp
         )
         target_compile_definitions(dnnopt_core PRIVATE DNNOPT_HAS_SME=1)
     else()
