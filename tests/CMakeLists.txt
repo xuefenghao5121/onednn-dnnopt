@@ -16,6 +16,12 @@ if(DNNOPT_BUILD_TESTS)
     target_link_libraries(test_elementwise_correctness PRIVATE dnnopt_core)
     add_test(NAME test_elementwise_correctness COMMAND test_elementwise_correctness)
 
+    if(DNNOPT_BUILD_BLAS)
+        add_executable(test_cblas test_cblas.cpp)
+        target_link_libraries(test_cblas PRIVATE dnnopt_blas)
+        add_test(NAME test_cblas COMMAND test_cblas)
+    endif()
+
     # Convenience target
     add_custom_target(run_tests
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -j${CMAKE_BUILD_PARALLEL_LEVEL}

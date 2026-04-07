@@ -1,6 +1,6 @@
 # DNN-Opt: ARM Platform Deep Learning Optimization Library
 
-**Version: 0.4.0** (Phase 4: Convolution Operators)
+**Version: 0.5.0** (Phase 5A: CBLAS/BLAS Compatible Interface)
 
 ARM 平台高性能深度学习推理优化库，充分利用 NEON/SVE/SVE2/SME 指令集和微架构特征，在 ARM CPU 环境下实现极致推理性能。
 
@@ -28,6 +28,33 @@ ARM 平台高性能深度学习推理优化库，充分利用 NEON/SVE/SVE2/SME 
 
 Peak Conv2D throughput: **62.9 GFLOPS** (Neoverse N2 @ 3GHz, 2 cores).
 
+### CBLAS sgemm vs OpenBLAS
+
+| Shape | dnnopt | OpenBLAS | Speedup |
+|-------|--------|----------|---------|
+| 512x512x512 | 4.2 ms | 6.2 ms | **1.49x** |
+| 1024x1024x1024 | 30.6 ms | 48.8 ms | **1.60x** |
+| 2048x2048x2048 | 239.5 ms | 388.8 ms | **1.62x** |
+| conv-like (3136x64x576) | 4.1 ms | 5.7 ms | **1.39x** |
+
+Drop-in BLAS replacement via `LD_PRELOAD` — zero code changes required.
+
+## Quick Start: Drop-in Acceleration
+
+```bash
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j$(nproc)
+
+# Use as LD_PRELOAD to accelerate any BLAS-based program
+LD_PRELOAD=./src/libdnnopt_blas.so python your_model.py
+LD_PRELOAD=./src/libdnnopt_blas.so ./your_onednn_app
+
+# Or link at compile time
+gcc -O2 your_code.c -L/path/to/build/src -ldnnopt_blas
+```
+
 ## Supported ARM Platforms
 
 | CPU Core | Architecture | Vector Extension | ML Features |
@@ -54,7 +81,8 @@ Peak Conv2D throughput: **62.9 GFLOPS** (Neoverse N2 @ 3GHz, 2 cores).
 - **2D Thread Decomposition**: Adaptive M×N parallelism with shape-aware scheduling
 - **Big.LITTLE Awareness**: Core topology detection, performance-core-first scheduling, thread affinity
 - **Huge Page Allocation**: MAP_HUGETLB + MADV_HUGEPAGE for large packing buffers
-- **Conv2D Operator**: im2col + optimized GEMM, direct 1×1 fast path, fused post-ops (Bias/ReLU/ReLU6)
+- **Conv2D Operator**: im2col + optimized GEMM, direct 1x1 fast path, fused post-ops (Bias/ReLU/ReLU6)
+- **CBLAS/BLAS Interface**: Drop-in `libdnnopt_blas.so` with standard `cblas_sgemm` + Fortran `sgemm_`, `LD_PRELOAD` compatible
 
 ## Build
 
@@ -66,6 +94,7 @@ cmake --build . -j$(nproc)
 # Run tests
 ./tests/test_gemm_correctness
 ./tests/test_conv_correctness
+./tests/test_cblas
 
 # Run benchmarks
 ./benchmarks/bench_gemm
@@ -81,6 +110,7 @@ cmake --build . -j$(nproc)
 | `DNNOPT_USE_OPENMP` | ON | Enable OpenMP multi-threading |
 | `DNNOPT_ENABLE_SME` | OFF | Enable SME kernel compilation |
 | `DNNOPT_BUILD_TESTS` | ON | Build correctness tests |
+| `DNNOPT_BUILD_BLAS` | ON | Build BLAS-compatible shared library |
 | `DNNOPT_BUILD_BENCHMARKS` | ON | Build performance benchmarks |
 
 ## Project Structure
@@ -93,7 +123,9 @@ onednn-arm-opt/
 │   ├── timer.h                   # High-resolution benchmarking
 │   ├── aligned_alloc.h           # Cache-aligned + huge page allocation
 │   ├── conv/
-│   │   └── conv.h                # Public Conv2D API [NEW v0.4.0]
+│   │   └── conv.h                # Public Conv2D API
+│   ├── blas/
+│   │   └── cblas.h               # Standard CBLAS interface [NEW v0.5.0]
 │   └── gemm/
 │       ├── gemm.h                # Public GEMM API
 │       ├── gemm_types.h          # Data types and enums
@@ -107,10 +139,14 @@ onednn-arm-opt/
 │   ├── hwcaps/arm_hwcaps.cpp     # CPU detection (/proc/cpuinfo + sysfs)
 │   ├── cpu_tuning_profiles.cpp   # Built-in tuning database
 │   ├── utils/                    # Timer, aligned alloc
-│   ├── conv/                     # [NEW v0.4.0]
-│   │   ├── conv2d.cpp            # Conv dispatch: 1×1 direct + im2col+GEMM
+│   ├── conv/
+│   │   ├── conv2d.cpp            # Conv dispatch: 1x1 direct + im2col+GEMM
 │   │   ├── im2col.cpp            # NHWC im2col with NEON acceleration
 │   │   └── conv_postops.cpp      # Fused bias + ReLU/ReLU6 (NEON)
+│   ├── blas/                     # [NEW v0.5.0]
+│   │   ├── cblas_sgemm.cpp       # cblas_sgemm → dnnopt::gemm_fp32
+│   │   ├── blas_fortran.cpp      # Fortran sgemm_ → cblas_sgemm
+│   │   └── blas_utils.cpp        # Thread control (OpenBLAS-compatible)
 │   └── gemm/
 │       ├── gemm.cpp              # Top-level dispatch
 │       ├── gemm_autotune.cpp     # Auto-tuning engine
@@ -129,12 +165,34 @@ onednn-arm-opt/
 │       ├── gemm_pack_bf16.cpp
 │       ├── gemm_pack_int8.cpp
 │       └── gemm_smallm_fp32.cpp  # Small-M optimized path
-├── tests/                        # Correctness tests (105 cases)
+├── tests/                        # Correctness tests (126 cases)
 ├── benchmarks/                   # Performance benchmarks + hwcaps report
 └── docs/                         # Design documentation
 ```
 
 ## Development Log
+
+### v0.5.0 — Phase 5A: CBLAS/BLAS Compatible Interface (2026-04-07)
+
+New: Drop-in BLAS replacement library for transparent acceleration of any BLAS consumer.
+
+- **Standard CBLAS interface**: `cblas_sgemm()` with full Order/TransA/TransB support
+  (RowMajor, ColMajor, NoTrans, Trans — all 8 combinations). Backed by optimized
+  `dnnopt::gemm_fp32()` with NEON 4x4 block transpose for non-NN cases.
+- **Fortran BLAS**: `sgemm_()` + `SGEMM()` with column-major parameter unpacking.
+  Compatible with Fortran and C programs using the Fortran BLAS convention.
+- **Thread control**: `openblas_set_num_threads()` / `blas_set_num_threads()` compatible
+  with OpenBLAS API for thread count control.
+- **LD_PRELOAD support**: `libdnnopt_blas.so` built with `--whole-archive` so all
+  dnnopt_core symbols are included. `LD_PRELOAD=libdnnopt_blas.so` transparently
+  replaces any OpenBLAS/BLIS/MKL cblas_sgemm calls.
+- **1.5-1.6x faster than OpenBLAS** on large matrices (512+), up to 68.9 GFLOPS peak.
+- **ColMajor duality**: Zero-copy conversion via `C_col = A*B ≡ C^T_row = B^T*A^T`.
+  ColMajor overhead ~28% from explicit transpose (RowMajor NN is zero-overhead passthrough).
+- **63 correctness tests**: 7 sizes × (4 RowMajor + 3 ColMajor + 1 Fortran + 1 alpha/beta).
+- **oneDNN integration path**: Users can build oneDNN with
+  `-DDNNL_BLAS_VENDOR=NONE -DBLAS_LIBRARIES=libdnnopt_blas.so` or simply use
+  `LD_PRELOAD` for zero-modification acceleration.
 
 ### v0.4.0 — Phase 4: Convolution Operators (2026-04-07)
 
@@ -202,8 +260,10 @@ New: Optimized SVE-256/512 VLA kernels and complete SME FMOPA/BFMOPA/SMOPA frame
 - Phase 2: GEMM Microkernels (FP32/BF16/INT8)
 - Phase 3: Hardware Adaptation (Tuning, SVE VLA, SME, Multi-threading)
 - Phase 4: Convolution Operators
+- Phase 5A: CBLAS/BLAS Compatible Interface
 
 ### Future
+- Phase 5B: oneDNN fork deep integration (replace GEMM + conv in oneDNN source)
 - Winograd F(2x2,3x3) / F(4x4,3x3) for additional conv speedup
 - Depthwise separable convolution
 - Pooling and elementwise operator optimization

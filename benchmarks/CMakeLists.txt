@@ -10,6 +10,11 @@ target_link_libraries(bench_elementwise PRIVATE dnnopt_core)
 add_executable(bench_pooling bench_pooling.cpp)
 target_link_libraries(bench_pooling PRIVATE dnnopt_core)
 
+if(DNNOPT_BUILD_BLAS)
+    add_executable(bench_blas bench_blas.cpp)
+    target_link_libraries(bench_blas PRIVATE dnnopt_blas ${CMAKE_DL_LIBS})
+endif()
+
 add_executable(hwcaps_report hwcaps_report.cpp)
 target_link_libraries(hwcaps_report PRIVATE dnnopt_core)
 

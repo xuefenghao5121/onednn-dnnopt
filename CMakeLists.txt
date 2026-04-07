@@ -27,6 +27,7 @@ option(DNNOPT_BUILD_BENCHMARKS "Build benchmark suite" ON)
 option(DNNOPT_BUILD_TESTS "Build regression tests" ON)
 option(DNNOPT_USE_OPENMP "Enable OpenMP" ON)
 option(DNNOPT_NATIVE_ARCH "Use -march=native" ON)
+option(DNNOPT_BUILD_BLAS "Build BLAS-compatible shared library (libdnnopt_blas.so)" ON)
 
 # ============================================================
 # Compiler flags
@@ -96,5 +97,6 @@ message(STATUS "  Arch flags:    ${ARCH_FLAGS}")
 message(STATUS "  OpenMP:        ${DNNOPT_USE_OPENMP}")
 message(STATUS "  Benchmarks:    ${DNNOPT_BUILD_BENCHMARKS}")
 message(STATUS "  Tests:         ${DNNOPT_BUILD_TESTS}")
+message(STATUS "  BLAS wrapper:  ${DNNOPT_BUILD_BLAS}")
 message(STATUS "  Compiler:      ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 message(STATUS "===================================")

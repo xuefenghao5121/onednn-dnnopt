@@ -28,6 +28,9 @@ target_include_directories(dnnopt_core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Need PIC for linking into shared library (libdnnopt_blas.so)
+set_target_properties(dnnopt_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # ============================================================
 # SVE kernels (conditional on compiler support)
 # ============================================================
@@ -95,4 +98,28 @@ if(DNNOPT_ENABLE_SME)
     endif()
 else()
     message(STATUS "SME support: DISABLED (use -DDNNOPT_ENABLE_SME=ON to enable)")
+endif()
+
+# ============================================================
+# BLAS-compatible shared library (drop-in replacement)
+# ============================================================
+if(DNNOPT_BUILD_BLAS)
+    add_library(dnnopt_blas SHARED
+        blas/cblas_sgemm.cpp
+        blas/blas_fortran.cpp
+        blas/blas_utils.cpp
+    )
+    target_link_libraries(dnnopt_blas PRIVATE dnnopt_core)
+    target_include_directories(dnnopt_blas PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    # Ensure all dnnopt_core symbols are included (needed for LD_PRELOAD)
+    if(NOT APPLE)
+        target_link_options(dnnopt_blas PRIVATE -Wl,--whole-archive $<TARGET_FILE:dnnopt_core> -Wl,--no-whole-archive)
+    endif()
+    set_target_properties(dnnopt_blas PROPERTIES
+        VERSION 0.5.0
+        SOVERSION 0
+    )
+    message(STATUS "BLAS wrapper: ON (libdnnopt_blas.so)")
 endif()
