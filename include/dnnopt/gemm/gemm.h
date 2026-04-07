@@ -38,4 +38,11 @@ void gemm_int8(int M, int N, int K,
                const float* B, int ldb,
                float beta, float* C, int ldc);
 
+/// Set the number of threads for GEMM operations.
+/// n=0: auto (use all cores), n=1: single-threaded.
+void gemm_set_num_threads(int n);
+
+/// Get the current thread count for GEMM operations.
+int gemm_get_num_threads();
+
 }  // namespace dnnopt

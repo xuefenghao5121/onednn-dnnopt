@@ -8,6 +8,7 @@
 /// packed_B layout: for each k, 12 contiguous floats (one Nr-panel row).
 
 #include "dnnopt/gemm/gemm_config.h"
+#include "dnnopt/gemm/gemm_ukernel_registry.h"
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -255,5 +256,59 @@ void gemm_ukernel_fp32_8x12(int K,
 }
 
 #endif  // __ARM_NEON
+
+// ============================================================
+// Registry wrappers + auto-registration
+// ============================================================
+
+// Original packing functions (defined in gemm_pack_fp32.cpp)
+void pack_a_fp32(int m_len, int k_len, const float* A, int lda, float* packed_A);
+void pack_b_fp32(int k_len, int n_len, const float* B, int ldb, float* packed_B);
+
+namespace {
+
+void ukernel_fp32_neon_wrap(int K, const void* packed_A, const void* packed_B,
+                            float* C, int ldc, float alpha, float beta,
+                            float /*extra*/) {
+#ifdef __ARM_NEON
+    gemm_ukernel_fp32_8x12(K,
+                            static_cast<const float*>(packed_A),
+                            static_cast<const float*>(packed_B),
+                            C, ldc, alpha, beta);
+#else
+    (void)K; (void)packed_A; (void)packed_B; (void)C; (void)ldc; (void)alpha; (void)beta;
+#endif
+}
+
+void pack_a_fp32_wrap(int m_len, int k_len, const float* A, int lda,
+                      void* packed_A, int /*Mr*/, float* /*scale_out*/) {
+    pack_a_fp32(m_len, k_len, A, lda, static_cast<float*>(packed_A));
+}
+
+void pack_b_fp32_wrap(int k_len, int n_len, const float* B, int ldb,
+                      void* packed_B, int /*Nr*/, float* /*scale_out*/) {
+    pack_b_fp32(k_len, n_len, B, ldb, static_cast<float*>(packed_B));
+}
+
+const GemmMicrokernelDesc neon_fp32_desc = {
+    "neon_fp32_8x12",
+    GemmDataType::kFP32,
+    kNEON,                // required_hwcaps
+    kGemmMrFp32,          // Mr = 8
+    kGemmNrFp32,          // Nr = 12
+    1,                    // Kgroup
+    false,                // nr_is_vla
+    100,                  // priority
+    sizeof(float),        // packed_a_elem_bytes
+    sizeof(float),        // packed_b_elem_bytes
+    0,                    // min_sve_bits
+    ukernel_fp32_neon_wrap,
+    pack_a_fp32_wrap,
+    pack_b_fp32_wrap,
+};
+
+static RegisterKernel reg_neon_fp32(neon_fp32_desc);
+
+}  // namespace
 
 }  // namespace dnnopt

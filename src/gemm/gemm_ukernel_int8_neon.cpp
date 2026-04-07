@@ -13,6 +13,7 @@
 /// Each 2×2 block: [r0c0, r0c1, r1c0, r1c1].
 
 #include "dnnopt/gemm/gemm_config.h"
+#include "dnnopt/gemm/gemm_ukernel_registry.h"
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -140,5 +141,70 @@ void gemm_ukernel_int8_8x8(int K,
 }
 
 #endif  // __ARM_NEON
+
+// ============================================================
+// Registry wrappers + auto-registration
+// ============================================================
+
+// Original packing functions (defined in gemm_pack_int8.cpp)
+void pack_a_int8(int m_len, int k_len, const float* A, int lda,
+                 int8_t* packed_A, float* scale_A);
+void pack_b_int8(int k_len, int n_len, const float* B, int ldb,
+                 int8_t* packed_B, float* scale_B);
+
+namespace {
+
+void ukernel_int8_neon_wrap(int K, const void* packed_A, const void* packed_B,
+                            float* C, int ldc, float alpha, float beta,
+                            float dequant_scale) {
+#ifdef __ARM_NEON
+    gemm_ukernel_int8_8x8(K,
+                           static_cast<const int8_t*>(packed_A),
+                           static_cast<const int8_t*>(packed_B),
+                           C, ldc, alpha, beta, dequant_scale);
+#else
+    (void)K; (void)packed_A; (void)packed_B; (void)C; (void)ldc;
+    (void)alpha; (void)beta; (void)dequant_scale;
+#endif
+}
+
+void pack_a_int8_wrap(int m_len, int k_len, const float* A, int lda,
+                      void* packed_A, int /*Mr*/, float* scale_out) {
+#ifdef __ARM_NEON
+    pack_a_int8(m_len, k_len, A, lda, static_cast<int8_t*>(packed_A), scale_out);
+#else
+    (void)m_len; (void)k_len; (void)A; (void)lda; (void)packed_A; (void)scale_out;
+#endif
+}
+
+void pack_b_int8_wrap(int k_len, int n_len, const float* B, int ldb,
+                      void* packed_B, int /*Nr*/, float* scale_out) {
+#ifdef __ARM_NEON
+    pack_b_int8(k_len, n_len, B, ldb, static_cast<int8_t*>(packed_B), scale_out);
+#else
+    (void)k_len; (void)n_len; (void)B; (void)ldb; (void)packed_B; (void)scale_out;
+#endif
+}
+
+const GemmMicrokernelDesc neon_int8_desc = {
+    "neon_int8_8x8",
+    GemmDataType::kINT8,
+    kNEON | kI8MM,        // required_hwcaps
+    kGemmMrInt8,          // Mr = 8
+    kGemmNrInt8,          // Nr = 8
+    8,                    // Kgroup
+    false,                // nr_is_vla
+    100,                  // priority
+    sizeof(int8_t),       // packed_a_elem_bytes
+    sizeof(int8_t),       // packed_b_elem_bytes
+    0,                    // min_sve_bits
+    ukernel_int8_neon_wrap,
+    pack_a_int8_wrap,
+    pack_b_int8_wrap,
+};
+
+static RegisterKernel reg_neon_int8(neon_int8_desc);
+
+}  // namespace
 
 }  // namespace dnnopt

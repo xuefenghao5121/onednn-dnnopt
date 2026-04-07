@@ -1,31 +1,28 @@
 /// @file gemm.cpp
-/// Top-level GEMM dispatch and naive fallback.
+/// Top-level GEMM dispatch with registry-based adaptive kernel selection.
+/// Falls back to legacy drivers when no registry kernel matches.
 
 #include "dnnopt/gemm/gemm.h"
 #include "dnnopt/gemm/gemm_config.h"
+#include "dnnopt/gemm/gemm_ukernel_registry.h"
+#include "dnnopt/gemm/gemm_driver_generic.h"
 #include "dnnopt/arm_hwcaps.h"
 
 namespace dnnopt {
 
-// BLIS driver (defined in gemm_driver_fp32.cpp)
+// Legacy drivers (preserved for fallback)
 void gemm_driver_fp32(int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb,
                       float beta, float* C, int ldc);
-
-// Small-M driver (defined in gemm_smallm_fp32.cpp)
 void gemm_smallm_driver_fp32(int M, int N, int K,
                               float alpha, const float* A, int lda,
                               const float* B, int ldb,
                               float beta, float* C, int ldc);
-
-// BF16 BLIS driver (defined in gemm_driver_bf16.cpp)
 void gemm_driver_bf16(int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb,
                       float beta, float* C, int ldc);
-
-// INT8 SMMLA driver (defined in gemm_driver_int8.cpp)
 void gemm_driver_int8(int M, int N, int K,
                       float alpha, const float* A, int lda,
                       const float* B, int ldb,
@@ -48,7 +45,51 @@ void gemm_naive_fp32(int M, int N, int K,
     }
 }
 
+/// Dispatch via registry + generic driver.
+/// Returns true if handled, false if caller should use legacy path.
+bool dispatch_via_registry(GemmDataType dtype,
+                           int M, int N, int K,
+                           float alpha, const float* A, int lda,
+                           const float* B, int ldb,
+                           float beta, float* C, int ldc) {
+    const auto& hw = detect_arm_hwcaps();
+    const auto* desc = GemmUkernelRegistry::instance().select(dtype, hw);
+    if (!desc) return false;
+
+    int Nr = desc->nr_is_vla ? desc->compute_nr(hw.sve_vector_bits) : desc->Nr;
+    int Mr = desc->Mr;
+
+    // Small-M: fall back to FP32 small-M driver (no packing overhead justified)
+    if (M < Mr) return false;
+
+    auto bp = compute_blocking_params(hw, Mr, Nr, desc->Kgroup,
+                                      desc->packed_a_elem_bytes,
+                                      desc->packed_b_elem_bytes,
+                                      M, N, K);
+
+    GemmDriverConfig cfg;
+    cfg.Mr = Mr;
+    cfg.Nr = Nr;
+    cfg.Kgroup = desc->Kgroup;
+    cfg.Mc = bp.Mc;
+    cfg.Nc = bp.Nc;
+    cfg.Kc = bp.Kc;
+    cfg.packed_a_elem_bytes = desc->packed_a_elem_bytes;
+    cfg.packed_b_elem_bytes = desc->packed_b_elem_bytes;
+    cfg.dtype = dtype;
+    cfg.ukernel = desc->ukernel;
+    cfg.pack_a = desc->pack_a;
+    cfg.pack_b = desc->pack_b;
+
+    gemm_driver_generic(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
+    return true;
+}
+
 }  // namespace
+
+// ============================================================
+// Public API
+// ============================================================
 
 void gemm_fp32(int M, int N, int K,
                float alpha, const float* A, int lda,
@@ -69,9 +110,23 @@ void gemm_fp32(int M, int N, int K,
         return;
     }
 
-    // Auto or explicit NEON
+    // Auto: try registry dispatch first
+    if (algo == GemmAlgo::kAuto) {
+        // Small-M uses dedicated fast path (no packing)
+        if (M < kGemmMrFp32) {
 #ifdef __ARM_NEON
-    if (algo == GemmAlgo::kAuto || algo == GemmAlgo::kNeonFp32) {
+            gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+            return;
+#endif
+        }
+        if (dispatch_via_registry(GemmDataType::kFP32, M, N, K,
+                                  alpha, A, lda, B, ldb, beta, C, ldc))
+            return;
+    }
+
+    // Explicit NEON or fallback from registry
+#ifdef __ARM_NEON
+    if (algo == GemmAlgo::kNeonFp32 || algo == GemmAlgo::kAuto) {
         if (M < kGemmMrFp32)
             gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         else
@@ -80,7 +135,6 @@ void gemm_fp32(int M, int N, int K,
     }
 #endif
 
-    // Fallback
     gemm_naive_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
@@ -90,22 +144,27 @@ void gemm_bf16(int M, int N, int K,
                float beta, float* C, int ldc) {
     if (M <= 0 || N <= 0 || K <= 0) return;
 
+    // Small-M: memory-bound, FP32 small-M is better
+    if (M <= kGemmMrBf16 / 2) {
+#ifdef __ARM_NEON
+        gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        return;
+#endif
+    }
+
+    // Try registry dispatch
+    if (dispatch_via_registry(GemmDataType::kBF16, M, N, K,
+                              alpha, A, lda, B, ldb, beta, C, ldc))
+        return;
+
+    // Legacy fallback
 #ifdef __ARM_NEON
     const auto& hw = detect_arm_hwcaps();
     if (hw.hwcaps & static_cast<uint64_t>(HwCap::kBF16)) {
-        // Small-M is memory-bound (arithmetic intensity < 1 FLOP/byte).
-        // For M <= 4 (≤50% tile utilization), FP32 small-M avoids packing
-        // overhead and is faster. For M=5-7, BFMMLA's compute density wins
-        // despite partial tile utilization.
-        if (M <= kGemmMrBf16 / 2)
-            gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        else
-            gemm_driver_bf16(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        gemm_driver_bf16(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
 #endif
-
-    // Fallback to FP32 if BF16 not available
     gemm_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
@@ -115,19 +174,27 @@ void gemm_int8(int M, int N, int K,
                float beta, float* C, int ldc) {
     if (M <= 0 || N <= 0 || K <= 0) return;
 
+    // Small-M: quantization overhead not worth it
+    if (M <= kGemmMrInt8 / 2) {
+#ifdef __ARM_NEON
+        gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        return;
+#endif
+    }
+
+    // Try registry dispatch
+    if (dispatch_via_registry(GemmDataType::kINT8, M, N, K,
+                              alpha, A, lda, B, ldb, beta, C, ldc))
+        return;
+
+    // Legacy fallback
 #ifdef __ARM_NEON
     const auto& hw = detect_arm_hwcaps();
     if (hw.hwcaps & static_cast<uint64_t>(HwCap::kI8MM)) {
-        // Small-M: memory-bound, quantization overhead not worth it
-        if (M <= kGemmMrInt8 / 2)
-            gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        else
-            gemm_driver_int8(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        gemm_driver_int8(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
 #endif
-
-    // Fallback to FP32 if I8MM not available
     gemm_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
