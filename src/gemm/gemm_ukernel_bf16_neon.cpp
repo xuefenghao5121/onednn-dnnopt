@@ -32,6 +32,10 @@ void gemm_ukernel_bf16_8x8(int K,
                             const bfloat16_t* packed_B,
                             float* C, int ldc,
                             float alpha, float beta) {
+    // Cast to __bf16* for GCC NEON intrinsics
+    const __bf16* pa = reinterpret_cast<const __bf16*>(packed_A);
+    const __bf16* pb = reinterpret_cast<const __bf16*>(packed_B);
+
     // 16 accumulators for 8×8 tile (each 2×2 FP32)
     float32x4_t c00 = vdupq_n_f32(0), c01 = vdupq_n_f32(0);
     float32x4_t c02 = vdupq_n_f32(0), c03 = vdupq_n_f32(0);
@@ -47,16 +51,16 @@ void gemm_ukernel_bf16_8x8(int K,
     int k4 = K / 4;
     for (int ki = 0; ki < k4; ++ki) {
         // Load A row-pairs: v0=rows[0:1], v1=rows[2:3], v2=rows[4:5], v3=rows[6:7]
-        bfloat16x8_t a0 = vld1q_bf16(packed_A);
-        bfloat16x8_t a1 = vld1q_bf16(packed_A + 8);
-        bfloat16x8_t a2 = vld1q_bf16(packed_A + 16);
-        bfloat16x8_t a3 = vld1q_bf16(packed_A + 24);
+        bfloat16x8_t a0 = vld1q_bf16(pa);
+        bfloat16x8_t a1 = vld1q_bf16(pa + 8);
+        bfloat16x8_t a2 = vld1q_bf16(pa + 16);
+        bfloat16x8_t a3 = vld1q_bf16(pa + 24);
 
         // Load B col-pairs: v4=cols[0:1], v5=cols[2:3], v6=cols[4:5], v7=cols[6:7]
-        bfloat16x8_t b0 = vld1q_bf16(packed_B);
-        bfloat16x8_t b1 = vld1q_bf16(packed_B + 8);
-        bfloat16x8_t b2 = vld1q_bf16(packed_B + 16);
-        bfloat16x8_t b3 = vld1q_bf16(packed_B + 24);
+        bfloat16x8_t b0 = vld1q_bf16(pb);
+        bfloat16x8_t b1 = vld1q_bf16(pb + 8);
+        bfloat16x8_t b2 = vld1q_bf16(pb + 16);
+        bfloat16x8_t b3 = vld1q_bf16(pb + 24);
 
         // 16 BFMMLA instructions: rows[i:i+1] × cols[j:j+1]
         // Row pair 0 (rows 0-1)
@@ -83,8 +87,8 @@ void gemm_ukernel_bf16_8x8(int K,
         c32 = vbfmmlaq_f32(c32, a3, b2);
         c33 = vbfmmlaq_f32(c33, a3, b3);
 
-        packed_A += 32;  // 4 row-pairs × 8 BF16
-        packed_B += 32;  // 4 col-pairs × 8 BF16
+        pa += 32;  // 4 row-pairs × 8 BF16
+        pb += 32;  // 4 col-pairs × 8 BF16
     }
 
     // Epilogue: write 8×8 FP32 accumulators to row-major C.

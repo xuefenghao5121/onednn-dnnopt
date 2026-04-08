@@ -30,6 +30,14 @@ void gemm_bf16(int M, int N, int K,
                const float* B, int ldb,
                float beta, float* C, int ldc);
 
+/// BF16 GEMM with native bfloat16 input (for oneDNN integration).
+/// A: M×K bfloat16 row-major, B: K×N bfloat16 row-major, C: M×N float row-major.
+/// Computes: C = alpha * A * B + beta * C
+void gemm_bf16_bf16bf16f32(int M, int N, int K,
+                           float alpha, const bfloat16_t* A, int lda,
+                           const bfloat16_t* B, int ldb,
+                           float beta, float* C, int ldc);
+
 /// INT8 GEMM: input/output FP32, internal compute INT8 via SMMLA.
 /// Uses symmetric per-tensor quantization. Requires ARMv8.6+ I8MM support.
 /// Falls back to FP32 if unavailable.

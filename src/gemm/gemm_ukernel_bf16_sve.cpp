@@ -50,7 +50,7 @@ static void pack_a_bf16_sve(int m_len, int k_len, const float* A, int lda,
                 bfloat16x4_t b0 = vcvt_bf16_f32(f0);
                 bfloat16x4_t b1 = vcvt_bf16_f32(f1);
                 bfloat16x8_t combined = vcombine_bf16(b0, b1);
-                vst1q_bf16(packed, combined);
+                vst1q_bf16(reinterpret_cast<__bf16*>(packed), combined);
                 packed += 8;
             }
         }
@@ -83,7 +83,7 @@ static void pack_b_bf16_sve(int k_len, int n_len, const float* B, int ldb,
                 bfloat16x4_t b0 = vcvt_bf16_f32(f0);
                 bfloat16x4_t b1 = vcvt_bf16_f32(f1);
                 bfloat16x8_t combined = vcombine_bf16(b0, b1);
-                vst1q_bf16(packed, combined);
+                vst1q_bf16(reinterpret_cast<__bf16*>(packed), combined);
                 packed += 8;
             }
         }
@@ -107,6 +107,10 @@ static void gemm_ukernel_bf16_sve_vla(int K,
                                        const bfloat16_t* packed_B,
                                        float* C, int ldc,
                                        float alpha, float beta) {
+    // Cast to __bf16* for GCC NEON intrinsics
+    const __bf16* pA_base = reinterpret_cast<const __bf16*>(packed_A);
+    const __bf16* pB_base = reinterpret_cast<const __bf16*>(packed_B);
+
     const int vl = (int)svcntw();
     const int Nr = 2 * vl;
     const int n_col_pairs = Nr / 2;
@@ -138,8 +142,8 @@ static void gemm_ukernel_bf16_sve_vla(int K,
         c20 = c21 = c22 = c23 = c24 = c25 = c26 = c27 = vdupq_n_f32(0);
         c30 = c31 = c32 = c33 = c34 = c35 = c36 = c37 = vdupq_n_f32(0);
 
-        const bfloat16_t* pA = packed_A;
-        const bfloat16_t* pB = packed_B + cp_base * 8;  // B offset for this cp chunk
+        const __bf16* pA = pA_base;
+        const __bf16* pB = pB_base + cp_base * 8;  // B offset for this cp chunk
         // B stride per K-group: n_col_pairs * 8 BF16
         const int b_stride = n_col_pairs * 8;
 
@@ -152,7 +156,7 @@ static void gemm_ukernel_bf16_sve_vla(int K,
             pA += 32;
 
             // Process each col-pair in this chunk
-            const bfloat16_t* pb = pB;
+            const __bf16* pb = pB;
 
 #define BF16_VLA_COLPAIR(idx)                       \
     if ((idx) < cp_count) {                         \
