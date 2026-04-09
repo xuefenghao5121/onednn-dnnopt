@@ -30,6 +30,12 @@ void gemm_driver_int8(int M, int N, int K,
                       const float* B, int ldb,
                       float beta, float* C, int ldc);
 
+// Tiny GEMM kernels (defined in gemm_tiny_fp32.cpp)
+bool gemm_tiny_dispatch_fp32(int M, int N, int K,
+                              float alpha, const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta, float* C, int ldc);
+
 namespace {
 
 /// Naive FP32 GEMM: C = alpha * A * B + beta * C
@@ -120,6 +126,13 @@ void gemm_fp32(int M, int N, int K,
 
     // Auto: try registry dispatch first
     if (algo == GemmAlgo::kAuto) {
+        // Tiny shapes: N=1, M=1, or M,N ≤ 4 get specialized kernels
+#ifdef __ARM_NEON
+        if (gemm_tiny_dispatch_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)) {
+            return;
+        }
+#endif
+
         // Small-M uses dedicated fast path (no packing)
         if (M < kGemmMrFp32) {
 #ifdef __ARM_NEON

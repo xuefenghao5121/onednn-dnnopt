@@ -285,78 +285,245 @@ static void gemm_neon_1xn(int K, int n_cols,
 }
 
 // ============================================================
+// Multi-row small-M kernels (M=2,4 parallel processing)
+// ============================================================
+
+/// 2×N microkernel: process 2 rows together for better SIMD utilization.
+/// Each row shares the same B access pattern, reducing memory traffic.
+/// K must be small enough to fit accumulators in registers.
+static void gemm_ukernel_fp32_2xN_kblock(int k_len,
+                                          const float* A0, const float* A1,
+                                          const float* B, int ldb,
+                                          float32x4_t c0, float32x4_t c1,
+                                          int j_start, int j_len) {
+    for (int k = 0; k < k_len; ++k) {
+        float32x4_t bk = vld1q_f32(&B[k * ldb + j_start]);
+        c0 = vfmaq_n_f32(c0, bk, A0[k]);
+        c1 = vfmaq_n_f32(c1, bk, A1[k]);
+    }
+}
+
+/// 4×N microkernel: process 4 rows together with K blocking.
+static void gemm_ukernel_fp32_4xN_kblock(int k_len,
+                                          const float* A, int lda,
+                                          const float* B, int ldb,
+                                          float32x4_t c0, float32x4_t c1,
+                                          float32x4_t c2, float32x4_t c3,
+                                          int j_start) {
+    const float* A0 = A;
+    const float* A1 = A + lda;
+    const float* A2 = A + 2 * lda;
+    const float* A3 = A + 3 * lda;
+
+    for (int k = 0; k < k_len; ++k) {
+        float32x4_t bk = vld1q_f32(&B[k * ldb + j_start]);
+        c0 = vfmaq_n_f32(c0, bk, A0[k]);
+        c1 = vfmaq_n_f32(c1, bk, A1[k]);
+        c2 = vfmaq_n_f32(c2, bk, A2[k]);
+        c3 = vfmaq_n_f32(c3, bk, A3[k]);
+    }
+}
+
+/// 2×N with K-blocking for large K matrices.
+static void gemm_ukernel_fp32_2xN(int N, int K,
+                                   const float* A0, const float* A1, int lda,
+                                   const float* B, int ldb,
+                                   float* C0, float* C1, int ldc,
+                                   float alpha, float beta) {
+    auto bp = get_gemm_blocking_params();
+    int Kc = bp.Kc;  // K-block size
+
+    // Process N in chunks of 4
+    int j = 0;
+    for (; j + 3 < N; j += 4) {
+        float32x4_t c0 = vdupq_n_f32(0);
+        float32x4_t c1 = vdupq_n_f32(0);
+
+        // K blocking for cache efficiency
+        for (int pc = 0; pc < K; pc += Kc) {
+            int kc = std::min(Kc, K - pc);
+            for (int k = 0; k < kc; ++k) {
+                float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+            }
+        }
+
+        float32x4_t av = vdupq_n_f32(alpha);
+        if (beta == 0.0f) {
+            vst1q_f32(&C0[j], vmulq_f32(av, c0));
+            vst1q_f32(&C1[j], vmulq_f32(av, c1));
+        } else {
+            float32x4_t bv = vdupq_n_f32(beta);
+            vst1q_f32(&C0[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C0[j])), av, c0));
+            vst1q_f32(&C1[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C1[j])), av, c1));
+        }
+    }
+
+    // Scalar tail
+    for (; j < N; ++j) {
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float bkj = B[k * ldb + j];
+            sum0 += A0[k] * bkj;
+            sum1 += A1[k] * bkj;
+        }
+        C0[j] = (beta == 0.0f) ? alpha * sum0 : alpha * sum0 + beta * C0[j];
+        C1[j] = (beta == 0.0f) ? alpha * sum1 : alpha * sum1 + beta * C1[j];
+    }
+}
+
+/// 4×N with K-blocking for large K matrices.
+static void gemm_ukernel_fp32_4xN(int N, int K,
+                                   const float* A, int lda,
+                                   const float* B, int ldb,
+                                   float* C, int ldc,
+                                   float alpha, float beta) {
+    auto bp = get_gemm_blocking_params();
+    int Kc = bp.Kc;  // K-block size
+
+    const float* A0 = A;
+    const float* A1 = A + lda;
+    const float* A2 = A + 2 * lda;
+    const float* A3 = A + 3 * lda;
+    float* C0 = C;
+    float* C1 = C + ldc;
+    float* C2 = C + 2 * ldc;
+    float* C3 = C + 3 * ldc;
+
+    // Process N in chunks of 4
+    int j = 0;
+    for (; j + 3 < N; j += 4) {
+        float32x4_t c0 = vdupq_n_f32(0);
+        float32x4_t c1 = vdupq_n_f32(0);
+        float32x4_t c2 = vdupq_n_f32(0);
+        float32x4_t c3 = vdupq_n_f32(0);
+
+        // K blocking for cache efficiency
+        for (int pc = 0; pc < K; pc += Kc) {
+            int kc = std::min(Kc, K - pc);
+            for (int k = 0; k < kc; ++k) {
+                float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+                c2 = vfmaq_n_f32(c2, bk, A2[pc + k]);
+                c3 = vfmaq_n_f32(c3, bk, A3[pc + k]);
+            }
+        }
+
+        float32x4_t av = vdupq_n_f32(alpha);
+        if (beta == 0.0f) {
+            vst1q_f32(&C0[j], vmulq_f32(av, c0));
+            vst1q_f32(&C1[j], vmulq_f32(av, c1));
+            vst1q_f32(&C2[j], vmulq_f32(av, c2));
+            vst1q_f32(&C3[j], vmulq_f32(av, c3));
+        } else {
+            float32x4_t bv = vdupq_n_f32(beta);
+            vst1q_f32(&C0[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C0[j])), av, c0));
+            vst1q_f32(&C1[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C1[j])), av, c1));
+            vst1q_f32(&C2[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C2[j])), av, c2));
+            vst1q_f32(&C3[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C3[j])), av, c3));
+        }
+    }
+
+    // Scalar tail
+    for (; j < N; ++j) {
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float bkj = B[k * ldb + j];
+            sum0 += A0[k] * bkj;
+            sum1 += A1[k] * bkj;
+            sum2 += A2[k] * bkj;
+            sum3 += A3[k] * bkj;
+        }
+        C0[j] = (beta == 0.0f) ? alpha * sum0 : alpha * sum0 + beta * C0[j];
+        C1[j] = (beta == 0.0f) ? alpha * sum1 : alpha * sum1 + beta * C1[j];
+        C2[j] = (beta == 0.0f) ? alpha * sum2 : alpha * sum2 + beta * C2[j];
+        C3[j] = (beta == 0.0f) ? alpha * sum3 : alpha * sum3 + beta * C3[j];
+    }
+}
+
+// ============================================================
 // Small-M drivers
 // ============================================================
 
-/// M=1 driver: no packing, direct B access with 1×48 microkernel.
+/// M=1 driver: optimized GEMV with panel-based processing.
+/// Processes N in panels of 64 for L1 cache efficiency.
 static void gemm_smallm1_fp32(int N, int K,
                                float alpha, const float* A, int lda,
                                const float* B, int ldb,
                                float beta, float* C, int ldc) {
-    auto bp = get_gemm_blocking_params();
-    int Kc = bp.Kc;
+    (void)lda; (void)ldc;  // M=1, stride not needed
+    constexpr int kPanelN = 64;
 
-    // Outer N loop, step 48
-    int j = 0;
-    for (; j + kSmallMNr - 1 < N; j += kSmallMNr) {
-        // K blocking
-        for (int pc = 0; pc < K; pc += Kc) {
-            int kc = std::min(Kc, K - pc);
-            float beta_eff = (pc == 0) ? beta : 1.0f;
-            float alpha_eff = (pc + kc >= K) ? alpha : 1.0f;
-            gemm_ukernel_fp32_1x48(kc, &A[pc], &B[pc * ldb + j], ldb,
-                                   &C[j], alpha_eff, beta_eff, /*packed=*/false);
+    for (int j0 = 0; j0 < N; j0 += kPanelN) {
+        int j_len = std::min(kPanelN, N - j0);
+
+        // Initialize accumulators (16 SIMD vectors = 64 floats)
+        float32x4_t acc[16];
+        for (int i = 0; i < 16; ++i) acc[i] = vdupq_n_f32(0);
+
+        // K-loop: each 4-wide segment of N uses its own accumulator
+        // acc[i] corresponds to columns [4i, 4i+3] within this panel
+        for (int k = 0; k < K; ++k) {
+            float ak = A[k];
+            float32x4_t av = vdupq_n_f32(ak);
+            const float* bk = B + k * ldb + j0;
+
+            for (int j = 0; j + 3 < j_len; j += 4) {
+                int idx = j / 4;  // accumulator index: 0..15
+                acc[idx] = vfmaq_f32(acc[idx], av, vld1q_f32(bk + j));
+            }
         }
-    }
-    // N tail (< 48 columns)
-    if (j < N) {
-        int n_rem = N - j;
-        for (int pc = 0; pc < K; pc += Kc) {
-            int kc = std::min(Kc, K - pc);
-            float beta_eff = (pc == 0) ? beta : 1.0f;
-            float alpha_eff = (pc + kc >= K) ? alpha : 1.0f;
-            gemm_neon_1xn(kc, n_rem, &A[pc], &B[pc * ldb + j], ldb,
-                          &C[j], alpha_eff, beta_eff);
+
+        // Store: each accumulator maps to its 4-wide segment
+        float32x4_t av = vdupq_n_f32(alpha);
+        float32x4_t bv = vdupq_n_f32(beta);
+        for (int j = 0; j + 3 < j_len; j += 4) {
+            int idx = j / 4;
+            if (beta == 0.0f) {
+                vst1q_f32(C + j0 + j, vmulq_f32(av, acc[idx]));
+            } else {
+                vst1q_f32(C + j0 + j, vfmaq_f32(vmulq_f32(bv, vld1q_f32(C + j0 + j)), av, acc[idx]));
+            }
+        }
+        // Scalar tail for N remainder (< 4)
+        for (int j = (j_len / 4) * 4; j < j_len; ++j) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; ++k) {
+                sum += A[k] * B[k * ldb + j0 + j];
+            }
+            C[j0 + j] = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * C[j0 + j];
         }
     }
 }
 
-/// M=2-7 driver: no A packing, no B packing, iterate rows with direct B access.
-/// B reuse across M rows is too small to justify packing overhead.
+/// M=2-7 driver: process multiple rows together for better B cache reuse.
+/// Uses 4-row and 2-row microkernels when possible.
 static void gemm_smallm_multi_fp32(int M, int N, int K,
                                     float alpha, const float* A, int lda,
                                     const float* B, int ldb,
                                     float beta, float* C, int ldc) {
-    auto bp = get_gemm_blocking_params();
-    int Kc = bp.Kc;
+    int i = 0;
 
-    for (int i = 0; i < M; ++i) {
-        const float* a_row = &A[i * lda];
-        float* c_row = &C[i * ldc];
+    // Process M=4 blocks
+    for (; i + 3 < M; i += 4) {
+        gemm_ukernel_fp32_4xN(N, K, A + i * lda, lda, B, ldb,
+                               C + i * ldc, ldc, alpha, beta);
+    }
 
-        // Full 48-col panels
-        int j = 0;
-        for (; j + kSmallMNr - 1 < N; j += kSmallMNr) {
-            for (int pc = 0; pc < K; pc += Kc) {
-                int kc = std::min(Kc, K - pc);
-                float beta_eff = (pc == 0) ? beta : 1.0f;
-                float alpha_eff = (pc + kc >= K) ? alpha : 1.0f;
-                gemm_ukernel_fp32_1x48(kc, &a_row[pc], &B[pc * ldb + j], ldb,
-                                       &c_row[j], alpha_eff, beta_eff,
-                                       /*packed=*/false);
-            }
-        }
-        // N tail (< 48 columns)
-        if (j < N) {
-            int n_rem = N - j;
-            for (int pc = 0; pc < K; pc += Kc) {
-                int kc = std::min(Kc, K - pc);
-                float beta_eff = (pc == 0) ? beta : 1.0f;
-                float alpha_eff = (pc + kc >= K) ? alpha : 1.0f;
-                gemm_neon_1xn(kc, n_rem, &a_row[pc], &B[pc * ldb + j], ldb,
-                              &c_row[j], alpha_eff, beta_eff);
-            }
-        }
+    // Process M=2 blocks
+    for (; i + 1 < M; i += 2) {
+        gemm_ukernel_fp32_2xN(N, K,
+                               A + i * lda, A + (i + 1) * lda, lda,
+                               B, ldb,
+                               C + i * ldc, C + (i + 1) * ldc, ldc,
+                               alpha, beta);
+    }
+
+    // Process remaining single row
+    if (i < M) {
+        gemm_smallm1_fp32(N, K, alpha, A + i * lda, lda, B, ldb, beta, C + i * ldc, ldc);
     }
 }
 

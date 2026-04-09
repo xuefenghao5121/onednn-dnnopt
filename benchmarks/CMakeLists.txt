@@ -1,6 +1,9 @@
 add_executable(bench_gemm bench_gemm.cpp)
 target_link_libraries(bench_gemm PRIVATE dnnopt_core)
 
+add_executable(bench_small_gemm bench_small_gemm.cpp)
+target_link_libraries(bench_small_gemm PRIVATE dnnopt_core)
+
 add_executable(bench_conv bench_conv.cpp)
 target_link_libraries(bench_conv PRIVATE dnnopt_core)
 
@@ -13,6 +16,9 @@ target_link_libraries(bench_pooling PRIVATE dnnopt_core)
 if(DNNOPT_BUILD_BLAS)
     add_executable(bench_blas bench_blas.cpp)
     target_link_libraries(bench_blas PRIVATE dnnopt_blas ${CMAKE_DL_LIBS})
+
+    add_executable(bench_small_vs_openblas bench_small_vs_openblas.cpp)
+    target_link_libraries(bench_small_vs_openblas PRIVATE dnnopt_blas ${CMAKE_DL_LIBS})
 endif()
 
 add_executable(hwcaps_report hwcaps_report.cpp)
