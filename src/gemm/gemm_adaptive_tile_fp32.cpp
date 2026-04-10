@@ -28,28 +28,43 @@ namespace dnnopt {
 // ============================================================
 
 TileConfig select_tile_fp32(int M, int N, int K, uint32_t l1d_bytes) {
-    struct Candidate { int Mr, Nr; };
+    struct Candidate { int Mr, Nr; bool hand_written; };
     static const Candidate candidates[] = {
-        {4, 16}, {6, 16}, {4, 12}, {8, 12}, {8, 8}, {12, 8}, {16, 4}
+        { 4, 16, true},   // zero-spill, 16 acc
+        { 6, 16, true},   // some spill, 24 acc
+        { 3, 16, true},   // zero-spill, 12 acc (tail kernel)
+        { 5, 16, true},   // zero-spill, 20 acc (tail kernel)
+        { 4, 12, false},  // template fallback
+        { 8, 12, false},  // template fallback
+        { 8,  8, false},  // template fallback
+        {12,  8, false},  // template fallback
+        {16,  4, false},  // template fallback
     };
 
-    TileConfig best = {8, 12};
+    TileConfig best = {4, 16};
     float best_score = -1.0f;
 
     for (const auto& c : candidates) {
         int Nr4 = c.Nr / 4;
+        if (c.Mr > M) continue;  // skip tiles larger than M
         if (c.Mr * Nr4 + 3 > 30) continue;
         if (l1d_bytes > 0 && (int64_t)c.Mr * K * 4 > (int64_t)l1d_bytes * 4 / 5)
             continue;
 
-        float reg_util = (float)(c.Mr * Nr4) / 27.0f;
-        int m_full = (M / c.Mr) * c.Mr;
-        int n_full = (N / c.Nr) * c.Nr;
-        float m_eff = (float)m_full / (float)M;
-        float n_eff = (float)n_full / (float)N;
-        float n_bonus = (N % c.Nr == 0) ? 1.0f : 0.7f;
+        // N-alignment: strongly prefer tiles that divide N evenly
+        float n_align = (N % c.Nr == 0) ? 1.0f : 0.6f;
 
-        float score = reg_util * m_eff * n_eff * n_bonus;
+        // M-coverage: fraction of rows handled by full tiles (no tail)
+        int m_full = (M / c.Mr) * c.Mr;
+        float m_eff = (float)m_full / (float)M;
+
+        // FMA density: more FMAs per K iteration → better pipeline utilization
+        float fma_density = (float)(c.Mr * Nr4) / 27.0f;
+
+        // Hand-written bonus: avoid template fallbacks (they have stack spills)
+        float hw_bonus = c.hand_written ? 1.0f : 0.5f;
+
+        float score = n_align * m_eff * fma_density * hw_bonus;
         if (score > best_score) {
             best_score = score;
             best = {c.Mr, c.Nr};
@@ -237,6 +252,110 @@ static void gemm_kernel_6x16(int K,
 }
 
 // ------------------------------------------------------------------
+// 3x16 kernel: 12 acc (3 rows × 4 quads), fits in 15 registers
+// Used for M-tail when Mr=4 and M_rem=3
+// ------------------------------------------------------------------
+static void __attribute__((noinline)) gemm_kernel_3x16(int K,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float* C, int ldc,
+                              float alpha, float beta) {
+    float32x4_t a00=vdupq_n_f32(0),a01=vdupq_n_f32(0),a02=vdupq_n_f32(0),a03=vdupq_n_f32(0);
+    float32x4_t a10=vdupq_n_f32(0),a11=vdupq_n_f32(0),a12=vdupq_n_f32(0),a13=vdupq_n_f32(0);
+    float32x4_t a20=vdupq_n_f32(0),a21=vdupq_n_f32(0),a22=vdupq_n_f32(0),a23=vdupq_n_f32(0);
+
+    const float *a0=A, *a1=A+lda, *a2=A+2*lda;
+
+    for (int k = 0; k < K; ++k) {
+        const float* bk = B + k * ldb;
+        float32x4_t b0 = vld1q_f32(bk);
+        float32x4_t b1 = vld1q_f32(bk + 4);
+        float32x4_t b2 = vld1q_f32(bk + 8);
+        float32x4_t b3 = vld1q_f32(bk + 12);
+
+        a00=vfmaq_n_f32(a00,b0,a0[k]); a01=vfmaq_n_f32(a01,b1,a0[k]);
+        a02=vfmaq_n_f32(a02,b2,a0[k]); a03=vfmaq_n_f32(a03,b3,a0[k]);
+        a10=vfmaq_n_f32(a10,b0,a1[k]); a11=vfmaq_n_f32(a11,b1,a1[k]);
+        a12=vfmaq_n_f32(a12,b2,a1[k]); a13=vfmaq_n_f32(a13,b3,a1[k]);
+        a20=vfmaq_n_f32(a20,b0,a2[k]); a21=vfmaq_n_f32(a21,b1,a2[k]);
+        a22=vfmaq_n_f32(a22,b2,a2[k]); a23=vfmaq_n_f32(a23,b3,a2[k]);
+    }
+
+    float32x4_t av = vdupq_n_f32(alpha);
+    #define STORE_ROW3(r, a0n,a1n,a2n,a3n) do { \
+        float* cr = C + (r)*ldc; \
+        float32x4_t s0=vmulq_f32(av,a0n), s1=vmulq_f32(av,a1n), \
+                    s2=vmulq_f32(av,a2n), s3=vmulq_f32(av,a3n); \
+        if (beta != 0.0f) { \
+            float32x4_t bv=vdupq_n_f32(beta); \
+            s0=vfmaq_f32(s0,bv,vld1q_f32(cr)); s1=vfmaq_f32(s1,bv,vld1q_f32(cr+4)); \
+            s2=vfmaq_f32(s2,bv,vld1q_f32(cr+8)); s3=vfmaq_f32(s3,bv,vld1q_f32(cr+12)); \
+        } \
+        vst1q_f32(cr,s0); vst1q_f32(cr+4,s1); vst1q_f32(cr+8,s2); vst1q_f32(cr+12,s3); \
+    } while(0)
+    STORE_ROW3(0, a00,a01,a02,a03);
+    STORE_ROW3(1, a10,a11,a12,a13);
+    STORE_ROW3(2, a20,a21,a22,a23);
+    #undef STORE_ROW3
+}
+
+// ------------------------------------------------------------------
+// 5x16 kernel: 20 acc (5 rows × 4 quads), fits in 23 registers
+// Used for M-tail when Mr=6 and M_rem=5, or standalone for M=5
+// ------------------------------------------------------------------
+static void __attribute__((noinline)) gemm_kernel_5x16(int K,
+                              const float* A, int lda,
+                              const float* B, int ldb,
+                              float* C, int ldc,
+                              float alpha, float beta) {
+    float32x4_t a00=vdupq_n_f32(0),a01=vdupq_n_f32(0),a02=vdupq_n_f32(0),a03=vdupq_n_f32(0);
+    float32x4_t a10=vdupq_n_f32(0),a11=vdupq_n_f32(0),a12=vdupq_n_f32(0),a13=vdupq_n_f32(0);
+    float32x4_t a20=vdupq_n_f32(0),a21=vdupq_n_f32(0),a22=vdupq_n_f32(0),a23=vdupq_n_f32(0);
+    float32x4_t a30=vdupq_n_f32(0),a31=vdupq_n_f32(0),a32=vdupq_n_f32(0),a33=vdupq_n_f32(0);
+    float32x4_t a40=vdupq_n_f32(0),a41=vdupq_n_f32(0),a42=vdupq_n_f32(0),a43=vdupq_n_f32(0);
+
+    const float *a0=A, *a1=A+lda, *a2=A+2*lda, *a3=A+3*lda, *a4=A+4*lda;
+
+    for (int k = 0; k < K; ++k) {
+        const float* bk = B + k * ldb;
+        float32x4_t b0 = vld1q_f32(bk);
+        float32x4_t b1 = vld1q_f32(bk + 4);
+        float32x4_t b2 = vld1q_f32(bk + 8);
+        float32x4_t b3 = vld1q_f32(bk + 12);
+
+        a00=vfmaq_n_f32(a00,b0,a0[k]); a01=vfmaq_n_f32(a01,b1,a0[k]);
+        a02=vfmaq_n_f32(a02,b2,a0[k]); a03=vfmaq_n_f32(a03,b3,a0[k]);
+        a10=vfmaq_n_f32(a10,b0,a1[k]); a11=vfmaq_n_f32(a11,b1,a1[k]);
+        a12=vfmaq_n_f32(a12,b2,a1[k]); a13=vfmaq_n_f32(a13,b3,a1[k]);
+        a20=vfmaq_n_f32(a20,b0,a2[k]); a21=vfmaq_n_f32(a21,b1,a2[k]);
+        a22=vfmaq_n_f32(a22,b2,a2[k]); a23=vfmaq_n_f32(a23,b3,a2[k]);
+        a30=vfmaq_n_f32(a30,b0,a3[k]); a31=vfmaq_n_f32(a31,b1,a3[k]);
+        a32=vfmaq_n_f32(a32,b2,a3[k]); a33=vfmaq_n_f32(a33,b3,a3[k]);
+        a40=vfmaq_n_f32(a40,b0,a4[k]); a41=vfmaq_n_f32(a41,b1,a4[k]);
+        a42=vfmaq_n_f32(a42,b2,a4[k]); a43=vfmaq_n_f32(a43,b3,a4[k]);
+    }
+
+    float32x4_t av = vdupq_n_f32(alpha);
+    #define STORE_ROW5(r, a0n,a1n,a2n,a3n) do { \
+        float* cr = C + (r)*ldc; \
+        float32x4_t s0=vmulq_f32(av,a0n), s1=vmulq_f32(av,a1n), \
+                    s2=vmulq_f32(av,a2n), s3=vmulq_f32(av,a3n); \
+        if (beta != 0.0f) { \
+            float32x4_t bv=vdupq_n_f32(beta); \
+            s0=vfmaq_f32(s0,bv,vld1q_f32(cr)); s1=vfmaq_f32(s1,bv,vld1q_f32(cr+4)); \
+            s2=vfmaq_f32(s2,bv,vld1q_f32(cr+8)); s3=vfmaq_f32(s3,bv,vld1q_f32(cr+12)); \
+        } \
+        vst1q_f32(cr,s0); vst1q_f32(cr+4,s1); vst1q_f32(cr+8,s2); vst1q_f32(cr+12,s3); \
+    } while(0)
+    STORE_ROW5(0, a00,a01,a02,a03);
+    STORE_ROW5(1, a10,a11,a12,a13);
+    STORE_ROW5(2, a20,a21,a22,a23);
+    STORE_ROW5(3, a30,a31,a32,a33);
+    STORE_ROW5(4, a40,a41,a42,a43);
+    #undef STORE_ROW5
+}
+
+// ------------------------------------------------------------------
 // Template fallback for non-critical tiles (using array accumulators)
 // ------------------------------------------------------------------
 template<int Mr, int Nr>
@@ -310,7 +429,9 @@ struct TileDispatch {
 };
 
 static const TileDispatch kTileDispatch[] = {
+    { 3, 16, gemm_kernel_3x16 },
     { 4, 16, gemm_kernel_4x16 },
+    { 5, 16, gemm_kernel_5x16 },
     { 6, 16, gemm_kernel_6x16 },
     { 4, 12, gemm_tile_kernel_full<4, 12> },
     { 8, 12, gemm_tile_kernel_full<8, 12> },
@@ -404,11 +525,20 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
                       C + i * ldc + j0, ldc,
                       alpha, beta);
         }
+        // M tail: use hand-written kernels for common sizes, fallback to alloca
         if (i < M) {
-            gemm_tile_tail(M - i, Nr, K, alpha,
-                           A + i * lda, lda,
-                           B + j0, ldb,
-                           beta, C + i * ldc + j0, ldc);
+            int m_rem = M - i;
+            const float* At = A + i * lda;
+            float* Ct = C + i * ldc + j0;
+            if (Nr == 16) {
+                switch (m_rem) {
+                case 3: gemm_kernel_3x16(K, At, lda, B+j0, ldb, Ct, ldc, alpha, beta); break;
+                case 5: gemm_kernel_5x16(K, At, lda, B+j0, ldb, Ct, ldc, alpha, beta); break;
+                default: gemm_tile_tail(m_rem, Nr, K, alpha, At, lda, B+j0, ldb, beta, Ct, ldc); break;
+                }
+            } else {
+                gemm_tile_tail(m_rem, Nr, K, alpha, At, lda, B+j0, ldb, beta, Ct, ldc);
+            }
         }
     }
 
