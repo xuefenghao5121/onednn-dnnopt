@@ -181,7 +181,45 @@ static void gemm_wide_4x16(int K,
     float32x4_t r3c0 = vdupq_n_f32(0), r3c1 = vdupq_n_f32(0);
     float32x4_t r3c2 = vdupq_n_f32(0), r3c3 = vdupq_n_f32(0);
 
-    for (int k = 0; k < K; ++k) {
+    int k = 0;
+    // 4x K-unrolled main loop: reduces branch overhead, improves ILP
+    for (; k + 3 < K; k += 4) {
+        for (int ki = 0; ki < 4; ++ki) {
+            int kk = k + ki;
+            const float* bk = B + kk * ldb + j0 + js;
+            float a0 = A0[kk], a1 = A1[kk], a2 = A2[kk], a3 = A3[kk];
+
+            float32x4_t b0 = vld1q_f32(bk);
+            r0c0 = vfmaq_n_f32(r0c0, b0, a0);
+            r1c0 = vfmaq_n_f32(r1c0, b0, a1);
+            r2c0 = vfmaq_n_f32(r2c0, b0, a2);
+            r3c0 = vfmaq_n_f32(r3c0, b0, a3);
+
+            if (sub_len > 4) {
+                float32x4_t b1 = vld1q_f32(bk + 4);
+                r0c1 = vfmaq_n_f32(r0c1, b1, a0);
+                r1c1 = vfmaq_n_f32(r1c1, b1, a1);
+                r2c1 = vfmaq_n_f32(r2c1, b1, a2);
+                r3c1 = vfmaq_n_f32(r3c1, b1, a3);
+            }
+            if (sub_len > 8) {
+                float32x4_t b2 = vld1q_f32(bk + 8);
+                r0c2 = vfmaq_n_f32(r0c2, b2, a0);
+                r1c2 = vfmaq_n_f32(r1c2, b2, a1);
+                r2c2 = vfmaq_n_f32(r2c2, b2, a2);
+                r3c2 = vfmaq_n_f32(r3c2, b2, a3);
+            }
+            if (sub_len > 12) {
+                float32x4_t b3 = vld1q_f32(bk + 12);
+                r0c3 = vfmaq_n_f32(r0c3, b3, a0);
+                r1c3 = vfmaq_n_f32(r1c3, b3, a1);
+                r2c3 = vfmaq_n_f32(r2c3, b3, a2);
+                r3c3 = vfmaq_n_f32(r3c3, b3, a3);
+            }
+        }
+    }
+    // Scalar K tail
+    for (; k < K; ++k) {
         const float* bk = B + k * ldb + j0 + js;
         float a0 = A0[k], a1 = A1[k], a2 = A2[k], a3 = A3[k];
 

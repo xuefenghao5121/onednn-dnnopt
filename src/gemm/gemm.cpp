@@ -156,20 +156,11 @@ void gemm_fp32(int M, int N, int K,
             return;
         }
 
-        // Phase 7B: unpacked path for small shapes where packing overhead dominates
-        // M<=32: any shape under threshold; M>32: only tall-thin (N<=16)
-        if ((int64_t)M * N * K < kUnpackedFlopsThreshold &&
-            (M <= 32 || N <= 16)) {
-            gemm_driver_unpacked_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-            return;
-        }
-
-        // Phase 7C: tall-thin (M>=32, N<=16) → per-column GEMV
-        // Only for shapes too large for unpacked path
-        if (M >= 32 && N <= 16) {
-            for (int j = 0; j < N; ++j)
-                gemm_mx1_fp32(M, K, alpha, A, lda,
-                              B + j, ldb, beta, C + j, ldc);
+        // Phase 8: adaptive tile GEMM (autoGEMM-style, unpacked)
+        // Only for small vol where packing overhead dominates compute.
+        // Medium/large vol uses registry (packed) path for better cache behavior.
+        if ((int64_t)M * N * K < kUnpackedFlopsThreshold && M >= 4) {
+            gemm_adaptive_tile_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
             return;
         }
 #endif
@@ -189,12 +180,8 @@ void gemm_fp32(int M, int N, int K,
                 gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else if (K <= 16) {
             gemm_smallK_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        } else if ((int64_t)M * N * K < kUnpackedFlopsThreshold &&
-                   (M <= 32 || N <= 16)) {
-            gemm_driver_unpacked_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        } else if (M >= 32 && N <= 16) {
-            for (int j = 0; j < N; ++j)
-                gemm_mx1_fp32(M, K, alpha, A, lda, B + j, ldb, beta, C + j, ldc);
+        } else if ((int64_t)M * N * K < kUnpackedFlopsThreshold && M >= 4) {
+            gemm_adaptive_tile_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else {
             gemm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         }

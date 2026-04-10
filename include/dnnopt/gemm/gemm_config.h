@@ -222,4 +222,22 @@ void gemm_mx1_fp32(int M, int K,
                     const float* B, int ldb,
                     float beta, float* C, int ldc);
 
+// ============================================================
+// Phase 8: Adaptive tile GEMM (autoGEMM-style dynamic assembly)
+// ============================================================
+
+/// Tile configuration for adaptive kernel selection.
+struct TileConfig {
+    int Mr, Nr;
+};
+
+/// Select optimal tile (Mr, Nr) for given shape and hardware.
+TileConfig select_tile_fp32(int M, int N, int K, uint32_t l1d_bytes);
+
+/// Adaptive tile GEMM driver (unpacked, no packing).
+void gemm_adaptive_tile_fp32(int M, int N, int K,
+                              float alpha, const float* A, int lda,
+                              const float* B, int ldb,
+                              float beta, float* C, int ldc);
+
 }  // namespace dnnopt
