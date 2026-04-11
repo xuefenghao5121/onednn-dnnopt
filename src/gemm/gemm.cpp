@@ -66,41 +66,44 @@ bool dispatch_via_registry(GemmDataType dtype,
                            float beta, float* C, int ldc) {
     const auto& hw = detect_arm_hwcaps();
     const auto& profile = get_autotuned_profile();
-    const auto* desc = GemmUkernelRegistry::instance().select(dtype, hw);
-    if (!desc) return false;
 
-    int Nr = desc->nr_is_vla ? desc->compute_nr(hw.sve_vector_bits) : desc->Nr;
-    int Mr = desc->Mr;
+    // Try all matching kernels in priority order until one fits M.
+    auto candidates = GemmUkernelRegistry::instance().select_all(dtype, hw);
+    for (const auto* desc : candidates) {
+        int Nr = desc->nr_is_vla ? desc->compute_nr(hw.sve_vector_bits) : desc->Nr;
+        int Mr = desc->Mr;
 
-    // Small-M: fall back to FP32 small-M driver (no packing overhead justified)
-    if (M < Mr) return false;
+        // Small-M: try next smaller kernel
+        if (M < Mr) continue;
 
-    auto bp = compute_blocking_params(hw, profile, Mr, Nr, desc->Kgroup,
-                                      desc->packed_a_elem_bytes,
-                                      desc->packed_b_elem_bytes,
-                                      M, N, K);
+        auto bp = compute_blocking_params(hw, profile, Mr, Nr, desc->Kgroup,
+                                          desc->packed_a_elem_bytes,
+                                          desc->packed_b_elem_bytes,
+                                          M, N, K);
 
-    GemmDriverConfig cfg;
-    cfg.Mr = Mr;
-    cfg.Nr = Nr;
-    cfg.Kgroup = desc->Kgroup;
-    cfg.Mc = bp.Mc;
-    cfg.Nc = bp.Nc;
-    cfg.Kc = bp.Kc;
-    cfg.packed_a_elem_bytes = desc->packed_a_elem_bytes;
-    cfg.packed_b_elem_bytes = desc->packed_b_elem_bytes;
-    cfg.dtype = dtype;
-    cfg.ukernel = desc->ukernel;
-    cfg.pack_a = desc->pack_a;
-    cfg.pack_b = desc->pack_b;
+        GemmDriverConfig cfg;
+        cfg.Mr = Mr;
+        cfg.Nr = Nr;
+        cfg.Kgroup = desc->Kgroup;
+        cfg.Mc = bp.Mc;
+        cfg.Nc = bp.Nc;
+        cfg.Kc = bp.Kc;
+        cfg.packed_a_elem_bytes = desc->packed_a_elem_bytes;
+        cfg.packed_b_elem_bytes = desc->packed_b_elem_bytes;
+        cfg.dtype = dtype;
+        cfg.ukernel = desc->ukernel;
+        cfg.pack_a = desc->pack_a;
+        cfg.pack_b = desc->pack_b;
 
-    // Threading config from tuning profile
-    cfg.threading_min_flops = profile.threading_min_flops;
-    cfg.prefer_2d_threading = profile.prefer_2d_threading;
-    cfg.shape = classify_shape(M, N, K);
+        // Threading config from tuning profile
+        cfg.threading_min_flops = profile.threading_min_flops;
+        cfg.prefer_2d_threading = profile.prefer_2d_threading;
+        cfg.shape = classify_shape(M, N, K);
 
-    gemm_driver_generic(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
-    return true;
+        gemm_driver_generic(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -138,16 +141,22 @@ void gemm_fp32(int M, int N, int K,
 #endif
 
         // Small-M uses dedicated fast path (no packing)
-        // Phase 9: M=4..7 can now use adaptive tile (asm kernels),
-        // so only route M=1..3 to smallm drivers unconditionally.
-        if (M < 4) {
+        // Phase B: M=2-7 with large N use wide driver (48-col macro-tiling + Kc blocking).
+        // M=1 uses dedicated GEMV path. M=4-7 with small N falls through to adaptive tile.
+        if (M < 8) {
 #ifdef __ARM_NEON
             if (M == 1) {
                 gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-            } else {
-                gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+                return;
             }
-            return;
+            // M=2-7: use wide driver for N >= 48 (macro-tiling benefit).
+            // M=2-3: always use wide driver (was original routing).
+            // M=4-7: only for N >= 48 where 48-col panels amortize B loads.
+            // For tiny N, fall through to adaptive tile (asm kernels better).
+            if (M >= 2 && (M < 4 || N >= 48)) {
+                gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+                return;
+            }
 #endif
         }
 
@@ -178,11 +187,10 @@ void gemm_fp32(int M, int N, int K,
     // Explicit NEON or fallback from registry
 #ifdef __ARM_NEON
     if (algo == GemmAlgo::kNeonFp32 || algo == GemmAlgo::kAuto) {
-        if (M < 4) {
-            if (M == 1)
-                gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-            else
-                gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        if (M == 1) {
+            gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        } else if (M >= 2 && M < 8 && (M < 4 || N >= 48)) {
+            gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else if (K <= 16) {
             gemm_smallK_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else if (M >= 4 && (

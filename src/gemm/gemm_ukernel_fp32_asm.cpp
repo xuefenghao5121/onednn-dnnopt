@@ -140,6 +140,10 @@ static void gemm_ukernel_fp32_packed_4x16_asm(
     ".p2align 4                                \n"
     "10:                                       \n"
 
+    // Prefetch B 8 K-steps ahead (8*64=512 bytes) and A 4 K-steps ahead (4*16=64 bytes)
+    "prfm    pldl1keep, [x22, #512]             \n"  // prefetch B[k+8]
+    "prfm    pldl1keep, [x11, #64]              \n"  // prefetch A[k+4]
+
     // Load A[k0] and B[k0]
     "ldr     q0, [x11], #16                    \n"
     "ldr     q8,  [x22]       \n"  "ldr     q9,  [x22, #16]  \n"

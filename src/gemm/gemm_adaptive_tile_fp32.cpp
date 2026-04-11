@@ -336,6 +336,13 @@ static void __attribute__((noinline)) gemm_kernel_3x16(int K,
     const float *a0=A, *a1=A+lda, *a2=A+2*lda;
 
     for (int k = 0; k < K; ++k) {
+        // Prefetch B row k+8 into L1
+        if (k + 8 < K) {
+            const float* bk_pf = B + (k + 8) * ldb;
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 8) : "memory");
+        }
+
         const float* bk = B + k * ldb;
         float32x4_t b0 = vld1q_f32(bk);
         float32x4_t b1 = vld1q_f32(bk + 4);
@@ -386,6 +393,13 @@ static void __attribute__((noinline)) gemm_kernel_5x16(int K,
     const float *a0=A, *a1=A+lda, *a2=A+2*lda, *a3=A+3*lda, *a4=A+4*lda;
 
     for (int k = 0; k < K; ++k) {
+        // Prefetch B row k+8 into L1
+        if (k + 8 < K) {
+            const float* bk_pf = B + (k + 8) * ldb;
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 8) : "memory");
+        }
+
         const float* bk = B + k * ldb;
         float32x4_t b0 = vld1q_f32(bk);
         float32x4_t b1 = vld1q_f32(bk + 4);
@@ -443,6 +457,12 @@ static void gemm_tile_kernel_full(int K,
     for (int i = 0; i < Mr; i++) a_row[i] = A + i * lda;
 
     for (int k = 0; k < K; ++k) {
+        // Prefetch B row k+8 into L1
+        if (k + 8 < K) {
+            const float* bk_pf = B + (k + 8) * ldb;
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+        }
+
         const float* bk = B + k * ldb;
         for (int j = 0; j < Nr4; j++) {
             float32x4_t bv = vld1q_f32(bk + j * 4);
@@ -536,6 +556,12 @@ static void gemm_tile_tail(int M, int N, int K,
     for (int x = 0; x < M * n_acc; x++) acc[x] = vdupq_n_f32(0);
 
     for (int k = 0; k < K; ++k) {
+        // Prefetch B row k+8 into L1
+        if (k + 8 < K) {
+            const float* bk_pf = B + (k + 8) * ldb;
+            __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+        }
+
         const float* bk = B + k * ldb;
         for (int j = 0; j < sub_full4; j += 4) {
             float32x4_t bv = vld1q_f32(bk + j);
@@ -612,6 +638,14 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
             for (int pc = 0; pc < K; pc += Kc) {
                 int kc = std::min(Kc, K - pc);
                 float beta_k = (pc == 0) ? beta : 1.0f;
+
+                // Prefetch B for next Kc block into L2
+                if (pc + Kc < K) {
+                    const float* b_next = B + (pc + Kc) * ldb + j0;
+                    __asm__ volatile("prfm pldl2keep, [%0]" : : "r"(b_next) : "memory");
+                    __asm__ volatile("prfm pldl2keep, [%0]" : : "r"(b_next + 8) : "memory");
+                }
+
                 kernel_fn(kc, A + i * lda + pc, lda,
                           B + pc * ldb + j0, ldb,
                           C + i * ldc + j0, ldc,

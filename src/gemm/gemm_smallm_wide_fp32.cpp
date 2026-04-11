@@ -31,6 +31,10 @@ static constexpr int kSubBlockN = 16;
 // Kc blocking for large-K: B[Kc][panelN] fits L1D.
 // L1D=64KB, panelN=48: Kc = 64KB / (48*4) = 341 → round to 256 for alignment.
 static constexpr int kWideKc = 256;
+// Prefetch distance (in K iterations) for L1 cache
+static constexpr int kPfDistL1 = 8;
+// Prefetch distance for L2 cache
+static constexpr int kPfDistL2 = 16;
 
 // ============================================================
 // Epilogue helpers
@@ -111,12 +115,30 @@ static void gemm_wide_2x48(int K,
             float a00 = A0[pc + k], a10 = A1[pc + k];
             float a01 = A0[pc + k + 1], a11 = A1[pc + k + 1];
 
+            // Prefetch A scalars ahead into L1
+            if (pc + k + kPfDistL1 < K) {
+                __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(A0 + pc + k + kPfDistL1) : "memory");
+                __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(A1 + pc + k + kPfDistL1) : "memory");
+            }
+
             for (int s = 0; s < n_subs; ++s) {
                 int js = s * kSubBlockN;
                 int sub_len = std::min(kSubBlockN, j_len - js);
                 int base = s * 4;
                 const float* bk0 = B + (pc + k) * ldb + j0 + js;
                 const float* bk1 = B + (pc + k + 1) * ldb + j0 + js;
+
+                // Prefetch B rows ahead into L1
+                if (pc + k + kPfDistL1 < K) {
+                    const float* bk_pf = B + (pc + k + kPfDistL1) * ldb + j0 + js;
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                    if (sub_len > 4)
+                        __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 4) : "memory");
+                    if (sub_len > 8)
+                        __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 8) : "memory");
+                    if (sub_len > 12)
+                        __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 12) : "memory");
+                }
 
                 // K iteration 0
                 float32x4_t b0 = vld1q_f32(bk0);
@@ -199,6 +221,18 @@ static void gemm_wide_4x16(int K,
         int k = 0;
         // 4x K-unrolled main loop
         for (; k + 3 < kc; k += 4) {
+            // Prefetch B row ahead into L1 (autoGEMM-style software pipelining)
+            if (pc + k + kPfDistL1 < K) {
+                const float* bk_pf = B + (pc + k + kPfDistL1) * ldb + j0 + js;
+                __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                if (sub_len > 4)
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 4) : "memory");
+                if (sub_len > 8)
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 8) : "memory");
+                if (sub_len > 12)
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 12) : "memory");
+            }
+
             for (int ki = 0; ki < 4; ++ki) {
                 int kk = pc + k + ki;
                 const float* bk = B + kk * ldb + j0 + js;
@@ -325,6 +359,17 @@ static void gemm_wide_MxN(int M, int K,
         for (int k = 0; k < kc; ++k) {
             int kk = pc + k;
             const float* bk = B + kk * ldb + j0;
+
+            // Prefetch B row ahead into L1
+            if (pc + k + kPfDistL1 < K) {
+                const float* bk_pf = B + (pc + k + kPfDistL1) * ldb + j0;
+                __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                if (sub_full4 > 4)
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 4) : "memory");
+                if (sub_full4 > 8)
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf + 8) : "memory");
+            }
+
             for (int j4 = 0; j4 < sub_full4; j4 += 4) {
                 float32x4_t bv = vld1q_f32(bk + j4);
                 int aidx = j4 / 4;
@@ -411,6 +456,13 @@ void gemm_smallm_wide_driver_fp32(int M, int N, int K,
                 int kc = std::min(kWideKc, K - pc);
                 for (int k = 0; k < kc; ++k) {
                     int kk = pc + k;
+
+                    // Prefetch B row ahead into L1
+                    if (pc + k + kPfDistL1 < K) {
+                        const float* bk_pf = B + (pc + k + kPfDistL1) * ldb + j0;
+                        __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                    }
+
                     float32x4_t av = vdupq_n_f32(a_row[kk]);
                     const float* bk = B + kk * ldb + j0;
                     for (int j = 0; j + 3 < j_len; j += 4)

@@ -1,9 +1,11 @@
 /// @file gemm_smallm_fp32_v2.cpp
 /// Optimized small-M specialized FP32 GEMM with prefetch and software pipelining.
 ///
-/// v2 improvements:
-///   - PRFM prefetch for L1/L2 cache lines
-///   - 8x K-unrolling for better ILP
+/// v2 improvements over v1:
+///   - PRFM prefetch for L1/L2 cache lines (B rows + A scalars ahead)
+///   - M=1: 8x K-unrolling with 1×48 wide kernel
+///   - M=2: 4x K-unrolling + PRFM prefetch + Kc blocking
+///   - M=4: 4x K-unrolling + PRFM prefetch + Kc blocking (B shared across rows)
 ///   - Software pipelining (load next iteration while computing current)
 ///   - Better register allocation (use all 32 NEON registers)
 ///   - Aligned loads when possible
@@ -453,10 +455,277 @@ static void gemm_smallm1_fp32_v2(int N, int K,
 }
 
 // ============================================================
+// M=2 driver: 2-row GEMM with prefetch + Kc blocking + 4x K-unroll
+// ============================================================
+
+/// 2×N microkernel v2: process 2 rows, 4 columns at a time.
+/// Improvements over v1:
+///   - PRFM prefetch for B rows ahead in K-loop (L1 keep)
+///   - PRFM prefetch for A scalar values ahead
+///   - 4x K-unrolling within Kc blocks for better ILP
+static void gemm_ukernel_fp32_2xN_v2(int N, int K,
+                                       const float* A0, const float* A1,
+                                       const float* B, int ldb,
+                                       float* C0, float* C1, int ldc,
+                                       float alpha, float beta) {
+    auto bp = get_gemm_blocking_params();
+    int Kc = bp.Kc;
+
+    int j = 0;
+    for (; j + 3 < N; j += 4) {
+        float32x4_t c0 = vdupq_n_f32(0);
+        float32x4_t c1 = vdupq_n_f32(0);
+
+        for (int pc = 0; pc < K; pc += Kc) {
+            int kc = std::min(Kc, K - pc);
+            int k = 0;
+
+            // 4x K-unrolled loop with prefetch
+            for (; k + 3 < kc; k += 4) {
+                // Prefetch B row k+8 into L1
+                if (pc + k + kPrefetchL1Dist < K) {
+                    const float* bk_pf = &B[(pc + k + kPrefetchL1Dist) * ldb + j];
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                }
+                // Prefetch A scalars ahead
+                if (pc + k + kPrefetchL1Dist < K) {
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A0 + pc + k + kPrefetchL1Dist) : "memory");
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A1 + pc + k + kPrefetchL1Dist) : "memory");
+                }
+
+                // Unrolled 4 K iterations
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 1) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 1]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 1]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 2) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 2]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 2]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 3) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 3]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 3]);
+                }
+            }
+            // Residual K iterations with prefetch
+            for (; k < kc; ++k) {
+                if (pc + k + kPrefetchL1Dist < K) {
+                    const float* bk_pf = &B[(pc + k + kPrefetchL1Dist) * ldb + j];
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                }
+                float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+            }
+        }
+
+        // Store epilogue
+        float32x4_t av = vdupq_n_f32(alpha);
+        if (beta == 0.0f) {
+            vst1q_f32(&C0[j], vmulq_f32(av, c0));
+            vst1q_f32(&C1[j], vmulq_f32(av, c1));
+        } else {
+            float32x4_t bv = vdupq_n_f32(beta);
+            vst1q_f32(&C0[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C0[j])), av, c0));
+            vst1q_f32(&C1[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C1[j])), av, c1));
+        }
+    }
+
+    // Scalar tail
+    for (; j < N; ++j) {
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float bkj = B[k * ldb + j];
+            sum0 += A0[k] * bkj;
+            sum1 += A1[k] * bkj;
+        }
+        C0[j] = (beta == 0.0f) ? alpha * sum0 : alpha * sum0 + beta * C0[j];
+        C1[j] = (beta == 0.0f) ? alpha * sum1 : alpha * sum1 + beta * C1[j];
+    }
+}
+
+// ============================================================
+// M=4 driver: 4-row GEMM with prefetch + Kc blocking + 4x K-unroll
+// ============================================================
+
+/// 4×N microkernel v2: process 4 rows, 4 columns at a time.
+/// Improvements over v1:
+///   - PRFM prefetch for B rows ahead in K-loop (L1 keep)
+///   - PRFM prefetch for A scalar values ahead (4 rows)
+///   - 4x K-unrolling within Kc blocks for better ILP
+static void gemm_ukernel_fp32_4xN_v2(int N, int K,
+                                       const float* A, int lda,
+                                       const float* B, int ldb,
+                                       float* C, int ldc,
+                                       float alpha, float beta) {
+    auto bp = get_gemm_blocking_params();
+    int Kc = bp.Kc;
+
+    const float* A0 = A;
+    const float* A1 = A + lda;
+    const float* A2 = A + 2 * lda;
+    const float* A3 = A + 3 * lda;
+    float* C0 = C;
+    float* C1 = C + ldc;
+    float* C2 = C + 2 * ldc;
+    float* C3 = C + 3 * ldc;
+
+    int j = 0;
+    for (; j + 3 < N; j += 4) {
+        float32x4_t c0 = vdupq_n_f32(0);
+        float32x4_t c1 = vdupq_n_f32(0);
+        float32x4_t c2 = vdupq_n_f32(0);
+        float32x4_t c3 = vdupq_n_f32(0);
+
+        for (int pc = 0; pc < K; pc += Kc) {
+            int kc = std::min(Kc, K - pc);
+            int k = 0;
+
+            // 4x K-unrolled loop with prefetch
+            for (; k + 3 < kc; k += 4) {
+                // Prefetch B row k+8 into L1
+                if (pc + k + kPrefetchL1Dist < K) {
+                    const float* bk_pf = &B[(pc + k + kPrefetchL1Dist) * ldb + j];
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                }
+                // Prefetch A scalars ahead for all 4 rows
+                if (pc + k + kPrefetchL1Dist < K) {
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A0 + pc + k + kPrefetchL1Dist) : "memory");
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A1 + pc + k + kPrefetchL1Dist) : "memory");
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A2 + pc + k + kPrefetchL1Dist) : "memory");
+                    __asm__ volatile("prfm pldl1keep, [%0]"
+                        : : "r"(A3 + pc + k + kPrefetchL1Dist) : "memory");
+                }
+
+                // Unrolled 4 K iterations — B loaded once, shared across 4 rows
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+                    c2 = vfmaq_n_f32(c2, bk, A2[pc + k]);
+                    c3 = vfmaq_n_f32(c3, bk, A3[pc + k]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 1) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 1]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 1]);
+                    c2 = vfmaq_n_f32(c2, bk, A2[pc + k + 1]);
+                    c3 = vfmaq_n_f32(c3, bk, A3[pc + k + 1]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 2) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 2]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 2]);
+                    c2 = vfmaq_n_f32(c2, bk, A2[pc + k + 2]);
+                    c3 = vfmaq_n_f32(c3, bk, A3[pc + k + 2]);
+                }
+                {
+                    float32x4_t bk = vld1q_f32(&B[(pc + k + 3) * ldb + j]);
+                    c0 = vfmaq_n_f32(c0, bk, A0[pc + k + 3]);
+                    c1 = vfmaq_n_f32(c1, bk, A1[pc + k + 3]);
+                    c2 = vfmaq_n_f32(c2, bk, A2[pc + k + 3]);
+                    c3 = vfmaq_n_f32(c3, bk, A3[pc + k + 3]);
+                }
+            }
+            // Residual K iterations with prefetch
+            for (; k < kc; ++k) {
+                if (pc + k + kPrefetchL1Dist < K) {
+                    const float* bk_pf = &B[(pc + k + kPrefetchL1Dist) * ldb + j];
+                    __asm__ volatile("prfm pldl1keep, [%0]" : : "r"(bk_pf) : "memory");
+                }
+                float32x4_t bk = vld1q_f32(&B[(pc + k) * ldb + j]);
+                c0 = vfmaq_n_f32(c0, bk, A0[pc + k]);
+                c1 = vfmaq_n_f32(c1, bk, A1[pc + k]);
+                c2 = vfmaq_n_f32(c2, bk, A2[pc + k]);
+                c3 = vfmaq_n_f32(c3, bk, A3[pc + k]);
+            }
+        }
+
+        // Store epilogue
+        float32x4_t av = vdupq_n_f32(alpha);
+        if (beta == 0.0f) {
+            vst1q_f32(&C0[j], vmulq_f32(av, c0));
+            vst1q_f32(&C1[j], vmulq_f32(av, c1));
+            vst1q_f32(&C2[j], vmulq_f32(av, c2));
+            vst1q_f32(&C3[j], vmulq_f32(av, c3));
+        } else {
+            float32x4_t bv = vdupq_n_f32(beta);
+            vst1q_f32(&C0[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C0[j])), av, c0));
+            vst1q_f32(&C1[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C1[j])), av, c1));
+            vst1q_f32(&C2[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C2[j])), av, c2));
+            vst1q_f32(&C3[j], vfmaq_f32(vmulq_f32(bv, vld1q_f32(&C3[j])), av, c3));
+        }
+    }
+
+    // Scalar tail
+    for (; j < N; ++j) {
+        float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            float bkj = B[k * ldb + j];
+            sum0 += A0[k] * bkj;
+            sum1 += A1[k] * bkj;
+            sum2 += A2[k] * bkj;
+            sum3 += A3[k] * bkj;
+        }
+        C0[j] = (beta == 0.0f) ? alpha * sum0 : alpha * sum0 + beta * C0[j];
+        C1[j] = (beta == 0.0f) ? alpha * sum1 : alpha * sum1 + beta * C1[j];
+        C2[j] = (beta == 0.0f) ? alpha * sum2 : alpha * sum2 + beta * C2[j];
+        C3[j] = (beta == 0.0f) ? alpha * sum3 : alpha * sum3 + beta * C3[j];
+    }
+}
+
+// ============================================================
+// Multi-row small-M dispatcher v2
+// ============================================================
+
+/// Dispatch M rows to v2 prefetch-optimized 4×N, 2×N, and 1×N kernels.
+static void gemm_smallm_multi_fp32_v2(int M, int N, int K,
+                                        float alpha, const float* A, int lda,
+                                        const float* B, int ldb,
+                                        float beta, float* C, int ldc) {
+    int i = 0;
+
+    // Process M=4 blocks with v2 prefetch-optimized kernel
+    for (; i + 3 < M; i += 4) {
+        gemm_ukernel_fp32_4xN_v2(N, K, A + i * lda, lda, B, ldb,
+                                  C + i * ldc, ldc, alpha, beta);
+    }
+
+    // Process M=2 blocks with v2 prefetch-optimized kernel
+    for (; i + 1 < M; i += 2) {
+        gemm_ukernel_fp32_2xN_v2(N, K,
+                                  A + i * lda, A + (i + 1) * lda,
+                                  B, ldb,
+                                  C + i * ldc, C + (i + 1) * ldc, ldc,
+                                  alpha, beta);
+    }
+
+    // Process remaining single row with v2 M=1 driver
+    if (i < M) {
+        gemm_smallm1_fp32_v2(N, K, alpha, A + i * lda, lda, B, ldb, beta, C + i * ldc, ldc);
+    }
+}
+
+// ============================================================
 // Public small-M driver entry point v2
 // ============================================================
 
 /// Public small-M driver entry point with prefetch optimizations.
+/// M=1: uses v2 prefetch-optimized GEMV with 8x K-unrolling.
+/// M>1: uses v2 4xN/2xN kernels with PRFM prefetch + 4x K-unrolling + Kc blocking.
 void gemm_smallm_driver_fp32_v2(int M, int N, int K,
                                  float alpha, const float* A, int lda,
                                  const float* B, int ldb,
@@ -464,9 +733,7 @@ void gemm_smallm_driver_fp32_v2(int M, int N, int K,
     if (M == 1) {
         gemm_smallm1_fp32_v2(N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     } else {
-        // For M > 1, use the original multi-row path from v1
-        // (TODO: add prefetch optimization to 2xN and 4xN paths)
-        gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        gemm_smallm_multi_fp32_v2(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
     }
 }
 

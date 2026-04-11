@@ -99,6 +99,7 @@ void gemm_kernel_4x16_asm(int K,
 
     // Compute 2*ldb for advancing B by 2 rows
     "lsl     x20, x16, #1                      \n"  // x20 = 2*ldb_bytes
+    "lsl     x19, x16, #2                      \n"  // x19 = 4*ldb_bytes (for B prefetch offset)
 
     // === Check if we have main loop iterations ===
     "cbz     %w[k_main], 20f                   \n"  // skip main loop if k_main==0
@@ -125,6 +126,10 @@ void gemm_kernel_4x16_asm(int K,
     // ================================================================
     ".p2align 4                                \n"
     "10:                                       \n"
+
+    // Prefetch B rows 4 and 5 K-steps ahead (x22+4*ldb, x23+4*ldb)
+    "prfm    pldl1keep, [x22, x19]             \n"  // prefetch B[k+4]
+    "prfm    pldl1keep, [x23, x19]             \n"  // prefetch B[k+5]
 
     // --- K+0: A set 0, .s[0], B from x23 (k=1) ---
     "fmla    v12.4s, v8.4s,  v0.s[0]           \n"
@@ -220,6 +225,11 @@ void gemm_kernel_4x16_asm(int K,
     "fmla    v27.4s, v11.4s, v3.s[3]           \n"
 
     // Load next A ping-pong set (q4-q7) and B[k=4] from x22
+    // Prefetch A 2 quads ahead (for next iteration's first A load)
+    "prfm    pldl1keep, [x11, #32]             \n"  // prefetch A row0 [k+8..k+11]
+    "prfm    pldl1keep, [x12, #32]             \n"  // prefetch A row1
+    "prfm    pldl1keep, [x13, #32]             \n"  // prefetch A row2
+    "prfm    pldl1keep, [x14, #32]             \n"  // prefetch A row3
     "ldr     q4, [x11], #16                    \n"  // A row0 [k4..k7]
     "ldr     q5, [x12], #16                    \n"  // A row1
     "ldr     q6, [x13], #16                    \n"  // A row2
@@ -720,7 +730,7 @@ void gemm_kernel_4x16_asm(int K,
     : "cc", "memory",
       "x6", "x7", "x8", "x9",
       "x11", "x12", "x13", "x14", "x15", "x16", "x17",
-      "x20", "x22", "x23",
+      "x19", "x20", "x22", "x23",
       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
       "v8", "v9", "v10", "v11",
       "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19",
@@ -795,6 +805,9 @@ void gemm_kernel_6x16_asm(int K,
     // === Setup B pointer ===
     "mov     x22, %[B]                         \n"
 
+    // Prefetch offset: 8*ldb_bytes
+    "lsl     x24, x16, #3                      \n"  // x24 = 8*ldb_bytes
+
     // === Zero 24 accumulators (v5-v28) ===
     "movi    v5.4s,  #0 \n"  "movi    v6.4s,  #0 \n"
     "movi    v7.4s,  #0 \n"  "movi    v8.4s,  #0 \n"
@@ -815,6 +828,8 @@ void gemm_kernel_6x16_asm(int K,
 
     ".p2align 4                                \n"
     "10:                                       \n"
+    // Prefetch B row 8 K-steps ahead
+    "prfm    pldl1keep, [x22, x24]             \n"  // prefetch B[k+8]
     // Load B row (4 vectors = 16 cols)
     "ldr     q1, [x22]                         \n"
     "ldr     q2, [x22, #16]                    \n"
@@ -980,7 +995,7 @@ void gemm_kernel_6x16_asm(int K,
       [beta_ptr] "r" (&beta)
     : "cc", "memory",
       "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
-      "x15", "x16", "x17", "x19", "x20", "x21", "x22", "x23",
+      "x15", "x16", "x17", "x19", "x20", "x21", "x22", "x23", "x24",
       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
       "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
       "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
@@ -989,7 +1004,7 @@ void gemm_kernel_6x16_asm(int K,
 }
 
 // ============================================================
-// 3×16 and 5×16 tail kernels (simpler, use scalar A loads)
+// 3x16 and 5x16 tail kernels (simpler, use scalar A loads)
 // ============================================================
 
 void gemm_kernel_3x16_asm(int K,
@@ -1020,6 +1035,9 @@ void gemm_kernel_3x16_asm(int K,
     // B pointer
     "mov     x22, %[B]                         \n"
 
+    // Prefetch offset: 8*ldb_bytes
+    "lsl     x24, x16, #3                      \n"  // x24 = 8*ldb_bytes
+
     // Zero 12 accumulators (v5-v16)
     "movi    v5.4s,  #0 \n"  "movi    v6.4s,  #0 \n"
     "movi    v7.4s,  #0 \n"  "movi    v8.4s,  #0 \n"
@@ -1033,6 +1051,7 @@ void gemm_kernel_3x16_asm(int K,
 
     ".p2align 4                                \n"
     "10:                                       \n"
+    "prfm    pldl1keep, [x22, x24]             \n"  // prefetch B[k+8]
     "ldr     q1, [x22]      \n"  "ldr     q2, [x22, #16] \n"
     "ldr     q3, [x22, #32] \n"  "ldr     q4, [x22, #48] \n"
     "add     x22, x22, x16                     \n"
@@ -1107,7 +1126,7 @@ void gemm_kernel_3x16_asm(int K,
     : [A] "r" (A), [B] "r" (B), [C] "r" (C), [K] "r" (K),
       [alpha_ptr] "r" (&alpha), [beta_ptr] "r" (&beta)
     : "cc", "memory",
-      "x6", "x7", "x8", "x9", "x10", "x11", "x15", "x16", "x17", "x22", "x23",
+      "x6", "x7", "x8", "x9", "x10", "x11", "x15", "x16", "x17", "x22", "x23", "x24",
       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8",
       "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v29"
     );
@@ -1145,6 +1164,9 @@ void gemm_kernel_5x16_asm(int K,
     // B pointer
     "mov     x22, %[B]                         \n"
 
+    // Prefetch offset: 8*ldb_bytes
+    "lsl     x24, x16, #3                      \n"  // x24 = 8*ldb_bytes
+
     // Zero 20 accumulators (v5-v24)
     "movi    v5.4s,  #0 \n"  "movi    v6.4s,  #0 \n"
     "movi    v7.4s,  #0 \n"  "movi    v8.4s,  #0 \n"
@@ -1162,6 +1184,7 @@ void gemm_kernel_5x16_asm(int K,
 
     ".p2align 4                                \n"
     "10:                                       \n"
+    "prfm    pldl1keep, [x22, x24]             \n"  // prefetch B[k+8]
     "ldr     q1, [x22]      \n"  "ldr     q2, [x22, #16] \n"
     "ldr     q3, [x22, #32] \n"  "ldr     q4, [x22, #48] \n"
     "add     x22, x22, x16                     \n"
@@ -1257,7 +1280,7 @@ void gemm_kernel_5x16_asm(int K,
       [alpha_ptr] "r" (&alpha), [beta_ptr] "r" (&beta)
     : "cc", "memory",
       "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
-      "x15", "x16", "x17", "x19", "x22", "x23",
+      "x15", "x16", "x17", "x19", "x22", "x23", "x24",
       "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8",
       "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16",
       "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v29"
