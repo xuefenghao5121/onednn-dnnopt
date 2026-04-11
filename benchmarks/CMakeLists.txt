@@ -40,3 +40,7 @@ add_custom_target(run_benchmarks
     COMMENT "Running all benchmarks"
     DEPENDS hwcaps_report bench_gemm bench_conv bench_elementwise bench_pooling
 )
+
+# Quick 4x16 kernel performance comparison
+add_executable(bench_4x16_perf bench_4x16_perf.cpp)
+target_link_libraries(bench_4x16_perf PRIVATE dnnopt_core)
