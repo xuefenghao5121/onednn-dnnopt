@@ -1,5 +1,5 @@
 /// @file bench_small_vs_openblas.cpp
-/// Compare dnnopt vs OpenBLAS on small and irregular GEMM shapes.
+/// Compare dnnopt vs OpenBLAS vs oneDNN on small and irregular GEMM shapes.
 /// Focus on shapes where autoGEMM should show advantage.
 
 #include "dnnopt/blas/cblas.h"
@@ -107,11 +107,17 @@ typedef void (*cblas_sgemm_fn)(int, int, int, int, int, int,
                                 const float*, int,
                                 float, float*, int);
 
+// oneDNN dnnl_sgemm signature
+typedef int (*dnnl_sgemm_fn)(char, char, long long, long long, long long,
+                              float, const float*, long long,
+                              const float*, long long, float,
+                              float*, long long);
+
 }  // namespace
 
 int main(int argc, char** argv) {
     printf("================================================================\n");
-    printf("  dnnopt vs OpenBLAS: Small & Irregular GEMM Shapes\n");
+    printf("  dnnopt vs OpenBLAS vs oneDNN: Small & Irregular GEMM Shapes\n");
     printf("================================================================\n\n");
 
     const auto& hw = dnnopt::detect_arm_hwcaps();
@@ -129,22 +135,39 @@ int main(int argc, char** argv) {
         openblas_sgemm = (cblas_sgemm_fn)dlsym(openblas_handle, "cblas_sgemm");
     }
 
-    if (openblas_sgemm) {
-        printf("OpenBLAS: loaded for comparison\n\n");
-    } else {
-        printf("OpenBLAS: not found (dnnopt only)\n\n");
+    // Load oneDNN
+    void* onednn_handle = dlopen("libdnnl.so.3", RTLD_LAZY | RTLD_LOCAL);
+    if (!onednn_handle) onednn_handle = dlopen("libdnnl.so", RTLD_LAZY | RTLD_LOCAL);
+    dnnl_sgemm_fn onednn_sgemm = nullptr;
+    if (onednn_handle) {
+        onednn_sgemm = (dnnl_sgemm_fn)dlsym(onednn_handle, "dnnl_sgemm");
     }
 
-    int num_shapes = sizeof(shapes) / sizeof(shapes[0]);
-    double dnnopt_total = 0, openblas_total = 0;
-    int dnnopt_wins = 0, openblas_wins = 0;
-    double best_speedup = 0, worst_speedup = 1e9;
-    const char* best_shape = "", *worst_shape = "";
+    printf("OpenBLAS: %s\n", openblas_sgemm ? "loaded" : "not found");
+    printf("oneDNN:   %s\n\n", onednn_sgemm ? "loaded" : "not found");
 
-    printf("%-20s %10s %10s %8s %10s\n",
-           "Shape", "dnnopt", "OpenBLAS", "Speedup", "dnnopt GF");
-    printf("%-20s %10s %10s %8s %10s\n",
-           "-----", "------", "--------", "-------", "---------");
+    bool has_openblas = (openblas_sgemm != nullptr);
+    bool has_onednn = (onednn_sgemm != nullptr);
+
+    int num_shapes = sizeof(shapes) / sizeof(shapes[0]);
+    double dnnopt_total = 0, openblas_total = 0, onednn_total = 0;
+    int dnnopt_wins_ob = 0, openblas_wins = 0;
+    int dnnopt_wins_dnn = 0, onednn_wins = 0;
+    double best_speedup_ob = 0, worst_speedup_ob = 1e9;
+    const char* best_shape_ob = "", *worst_shape_ob = "";
+
+    // Header
+    if (has_openblas && has_onednn) {
+        printf("%-20s %8s %8s %8s %6s %6s %8s\n",
+               "Shape", "dnnopt", "OB", "oneDNN", "vsOB", "vsDNN", "dnnoptGF");
+        printf("%-20s %8s %8s %8s %6s %6s %8s\n",
+               "-----", "------", "--", "------", "----", "-----", "-------");
+    } else {
+        printf("%-20s %10s %10s %8s %10s\n",
+               "Shape", "dnnopt", "OpenBLAS", "Speedup", "dnnopt GF");
+        printf("%-20s %10s %10s %8s %10s\n",
+               "-----", "------", "--------", "-------", "---------");
+    }
 
     for (int s = 0; s < num_shapes; ++s) {
         int M = shapes[s].M;
@@ -182,7 +205,38 @@ int main(int argc, char** argv) {
             openblas_ms = ob_stats.median_ms;
         }
 
-        if (openblas_sgemm && openblas_ms > 0) {
+        // Benchmark oneDNN
+        double onednn_ms = 0;
+        if (onednn_sgemm) {
+            auto dnn_stats = dnnopt::benchmark(shapes[s].label, flops, bytes, warmup, runs, [&]() {
+                memset(C.get(), 0, c_sz * sizeof(float));
+                onednn_sgemm('N', 'N', (long long)M, (long long)N, (long long)K,
+                             1.0f, A.get(), (long long)K, B.get(), (long long)N,
+                             0.0f, C.get(), (long long)N);
+            });
+            onednn_ms = dnn_stats.median_ms;
+        }
+
+        // Print results
+        if (has_openblas && has_onednn && openblas_ms > 0 && onednn_ms > 0) {
+            double vs_ob = openblas_ms / dnnopt_stats.median_ms;
+            double vs_dnn = onednn_ms / dnnopt_stats.median_ms;
+            printf("%-20s %7.3f  %7.3f  %7.3f  %5.2fx %5.2fx %7.2f\n",
+                   shapes[s].label, dnnopt_stats.median_ms, openblas_ms, onednn_ms,
+                   vs_ob, vs_dnn, dnnopt_stats.gflops);
+
+            dnnopt_total += dnnopt_stats.median_ms;
+            openblas_total += openblas_ms;
+            onednn_total += onednn_ms;
+
+            if (vs_ob > 1.0) dnnopt_wins_ob++;
+            else openblas_wins++;
+            if (vs_dnn > 1.0) dnnopt_wins_dnn++;
+            else onednn_wins++;
+
+            if (vs_ob > best_speedup_ob) { best_speedup_ob = vs_ob; best_shape_ob = shapes[s].label; }
+            if (vs_ob < worst_speedup_ob) { worst_speedup_ob = vs_ob; worst_shape_ob = shapes[s].label; }
+        } else if (has_openblas && openblas_ms > 0) {
             double speedup = openblas_ms / dnnopt_stats.median_ms;
             printf("%-20s %9.3f  %9.3f  %7.2fx  %9.2f\n",
                    shapes[s].label, dnnopt_stats.median_ms, openblas_ms, speedup, dnnopt_stats.gflops);
@@ -190,17 +244,11 @@ int main(int argc, char** argv) {
             dnnopt_total += dnnopt_stats.median_ms;
             openblas_total += openblas_ms;
 
-            if (speedup > 1.0) dnnopt_wins++;
+            if (speedup > 1.0) dnnopt_wins_ob++;
             else openblas_wins++;
 
-            if (speedup > best_speedup) {
-                best_speedup = speedup;
-                best_shape = shapes[s].label;
-            }
-            if (speedup < worst_speedup) {
-                worst_speedup = speedup;
-                worst_shape = shapes[s].label;
-            }
+            if (speedup > best_speedup_ob) { best_speedup_ob = speedup; best_shape_ob = shapes[s].label; }
+            if (speedup < worst_speedup_ob) { worst_speedup_ob = speedup; worst_shape_ob = shapes[s].label; }
         } else {
             printf("%-20s %9.3f  %10s  %8s  %9.2f\n",
                    shapes[s].label, dnnopt_stats.median_ms, "N/A", "N/A", dnnopt_stats.gflops);
@@ -210,14 +258,22 @@ int main(int argc, char** argv) {
     printf("\n================================================================\n");
     printf("  Summary\n");
     printf("================================================================\n");
-    if (openblas_sgemm) {
+    if (has_openblas && openblas_total > 0) {
         printf("Total time: dnnopt=%.3f ms, OpenBLAS=%.3f ms\n", dnnopt_total, openblas_total);
-        printf("Overall speedup: %.2fx\n", openblas_total / dnnopt_total);
-        printf("dnnopt wins: %d, OpenBLAS wins: %d\n", dnnopt_wins, openblas_wins);
-        printf("Best speedup: %.2fx (%s)\n", best_speedup, best_shape);
-        printf("Worst speedup: %.2fx (%s)\n", worst_speedup, worst_shape);
+        printf("Overall vs OpenBLAS: %.2fx (dnnopt wins: %d, OpenBLAS wins: %d)\n",
+               openblas_total / dnnopt_total, dnnopt_wins_ob, openblas_wins);
+    }
+    if (has_onednn && onednn_total > 0) {
+        printf("Total time: oneDNN=%.3f ms\n", onednn_total);
+        printf("Overall vs oneDNN:   %.2fx (dnnopt wins: %d, oneDNN wins: %d)\n",
+               onednn_total / dnnopt_total, dnnopt_wins_dnn, onednn_wins);
+    }
+    if (has_openblas && openblas_total > 0) {
+        printf("Best speedup: %.2fx (%s)\n", best_speedup_ob, best_shape_ob);
+        printf("Worst speedup: %.2fx (%s)\n", worst_speedup_ob, worst_shape_ob);
     }
 
     if (openblas_handle) dlclose(openblas_handle);
+    if (onednn_handle) dlclose(onednn_handle);
     return 0;
 }

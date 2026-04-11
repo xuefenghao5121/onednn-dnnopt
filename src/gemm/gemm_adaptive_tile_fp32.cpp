@@ -109,6 +109,7 @@ static inline void store_acc_beta1(
 
 // ------------------------------------------------------------------
 // 4x16 kernel: 16 acc (4 rows × 4 quads), fits in 19 registers
+// 2x K-unrolling: 16 acc + 8 B loads = 24 SIMD regs → fit in 32
 // ------------------------------------------------------------------
 static void gemm_kernel_4x16(int K,
                               const float* A, int lda,
@@ -126,32 +127,58 @@ static void gemm_kernel_4x16(int K,
 
     const float *a0 = A, *a1 = A + lda, *a2 = A + 2*lda, *a3 = A + 3*lda;
 
-    for (int k = 0; k < K; ++k) {
+    // 2x K-unrolled loop: prefetch next B while computing current
+    int k = 0;
+    for (; k + 1 < K; k += 2) {
+        const float* bk0 = B + k * ldb;
+        const float* bk1 = B + (k + 1) * ldb;
+
+        // Prefetch next B into registers
+        float32x4_t nb0 = vld1q_f32(bk1);
+        float32x4_t nb1 = vld1q_f32(bk1 + 4);
+        float32x4_t nb2 = vld1q_f32(bk1 + 8);
+        float32x4_t nb3 = vld1q_f32(bk1 + 12);
+
+        // Current iteration
+        float32x4_t b0 = vld1q_f32(bk0);
+        float32x4_t b1 = vld1q_f32(bk0 + 4);
+        float32x4_t b2 = vld1q_f32(bk0 + 8);
+        float32x4_t b3 = vld1q_f32(bk0 + 12);
+
+        a00 = vfmaq_n_f32(a00, b0, a0[k]); a01 = vfmaq_n_f32(a01, b1, a0[k]);
+        a02 = vfmaq_n_f32(a02, b2, a0[k]); a03 = vfmaq_n_f32(a03, b3, a0[k]);
+        a10 = vfmaq_n_f32(a10, b0, a1[k]); a11 = vfmaq_n_f32(a11, b1, a1[k]);
+        a12 = vfmaq_n_f32(a12, b2, a1[k]); a13 = vfmaq_n_f32(a13, b3, a1[k]);
+        a20 = vfmaq_n_f32(a20, b0, a2[k]); a21 = vfmaq_n_f32(a21, b1, a2[k]);
+        a22 = vfmaq_n_f32(a22, b2, a2[k]); a23 = vfmaq_n_f32(a23, b3, a2[k]);
+        a30 = vfmaq_n_f32(a30, b0, a3[k]); a31 = vfmaq_n_f32(a31, b1, a3[k]);
+        a32 = vfmaq_n_f32(a32, b2, a3[k]); a33 = vfmaq_n_f32(a33, b3, a3[k]);
+
+        // Next iteration using prefetched B
+        a00 = vfmaq_n_f32(a00, nb0, a0[k+1]); a01 = vfmaq_n_f32(a01, nb1, a0[k+1]);
+        a02 = vfmaq_n_f32(a02, nb2, a0[k+1]); a03 = vfmaq_n_f32(a03, nb3, a0[k+1]);
+        a10 = vfmaq_n_f32(a10, nb0, a1[k+1]); a11 = vfmaq_n_f32(a11, nb1, a1[k+1]);
+        a12 = vfmaq_n_f32(a12, nb2, a1[k+1]); a13 = vfmaq_n_f32(a13, nb3, a1[k+1]);
+        a20 = vfmaq_n_f32(a20, nb0, a2[k+1]); a21 = vfmaq_n_f32(a21, nb1, a2[k+1]);
+        a22 = vfmaq_n_f32(a22, nb2, a2[k+1]); a23 = vfmaq_n_f32(a23, nb3, a2[k+1]);
+        a30 = vfmaq_n_f32(a30, nb0, a3[k+1]); a31 = vfmaq_n_f32(a31, nb1, a3[k+1]);
+        a32 = vfmaq_n_f32(a32, nb2, a3[k+1]); a33 = vfmaq_n_f32(a33, nb3, a3[k+1]);
+    }
+    // K tail (odd K)
+    if (k < K) {
         const float* bk = B + k * ldb;
         float32x4_t b0 = vld1q_f32(bk);
         float32x4_t b1 = vld1q_f32(bk + 4);
         float32x4_t b2 = vld1q_f32(bk + 8);
         float32x4_t b3 = vld1q_f32(bk + 12);
-
-        a00 = vfmaq_n_f32(a00, b0, a0[k]);
-        a01 = vfmaq_n_f32(a01, b1, a0[k]);
-        a02 = vfmaq_n_f32(a02, b2, a0[k]);
-        a03 = vfmaq_n_f32(a03, b3, a0[k]);
-
-        a10 = vfmaq_n_f32(a10, b0, a1[k]);
-        a11 = vfmaq_n_f32(a11, b1, a1[k]);
-        a12 = vfmaq_n_f32(a12, b2, a1[k]);
-        a13 = vfmaq_n_f32(a13, b3, a1[k]);
-
-        a20 = vfmaq_n_f32(a20, b0, a2[k]);
-        a21 = vfmaq_n_f32(a21, b1, a2[k]);
-        a22 = vfmaq_n_f32(a22, b2, a2[k]);
-        a23 = vfmaq_n_f32(a23, b3, a2[k]);
-
-        a30 = vfmaq_n_f32(a30, b0, a3[k]);
-        a31 = vfmaq_n_f32(a31, b1, a3[k]);
-        a32 = vfmaq_n_f32(a32, b2, a3[k]);
-        a33 = vfmaq_n_f32(a33, b3, a3[k]);
+        a00 = vfmaq_n_f32(a00, b0, a0[k]); a01 = vfmaq_n_f32(a01, b1, a0[k]);
+        a02 = vfmaq_n_f32(a02, b2, a0[k]); a03 = vfmaq_n_f32(a03, b3, a0[k]);
+        a10 = vfmaq_n_f32(a10, b0, a1[k]); a11 = vfmaq_n_f32(a11, b1, a1[k]);
+        a12 = vfmaq_n_f32(a12, b2, a1[k]); a13 = vfmaq_n_f32(a13, b3, a1[k]);
+        a20 = vfmaq_n_f32(a20, b0, a2[k]); a21 = vfmaq_n_f32(a21, b1, a2[k]);
+        a22 = vfmaq_n_f32(a22, b2, a2[k]); a23 = vfmaq_n_f32(a23, b3, a2[k]);
+        a30 = vfmaq_n_f32(a30, b0, a3[k]); a31 = vfmaq_n_f32(a31, b1, a3[k]);
+        a32 = vfmaq_n_f32(a32, b2, a3[k]); a33 = vfmaq_n_f32(a33, b3, a3[k]);
     }
 
     float32x4_t av = vdupq_n_f32(alpha);
@@ -168,7 +195,7 @@ static void gemm_kernel_4x16(int K,
         vst1q_f32(c3+8,  vmulq_f32(av, a32)); vst1q_f32(c3+12, vmulq_f32(av, a33));
     } else {
         float32x4_t bvv = vdupq_n_f32(beta);
-        #define STORE_R(r, a0n, a1n, a2n, a3n) do { \
+        #define STORE_R4(r, a0n, a1n, a2n, a3n) do { \
             float* cr = c##r; \
             float32x4_t s0 = vfmaq_f32(vmulq_f32(av, a0n), bvv, vld1q_f32(cr)); \
             float32x4_t s1 = vfmaq_f32(vmulq_f32(av, a1n), bvv, vld1q_f32(cr+4)); \
@@ -177,16 +204,16 @@ static void gemm_kernel_4x16(int K,
             vst1q_f32(cr, s0); vst1q_f32(cr+4, s1); \
             vst1q_f32(cr+8, s2); vst1q_f32(cr+12, s3); \
         } while(0)
-        STORE_R(0, a00, a01, a02, a03);
-        STORE_R(1, a10, a11, a12, a13);
-        STORE_R(2, a20, a21, a22, a23);
-        STORE_R(3, a30, a31, a32, a33);
-        #undef STORE_R
+        STORE_R4(0, a00, a01, a02, a03);
+        STORE_R4(1, a10, a11, a12, a13);
+        STORE_R4(2, a20, a21, a22, a23);
+        STORE_R4(3, a30, a31, a32, a33);
+        #undef STORE_R4
     }
 }
-
 // ------------------------------------------------------------------
-// 6x16 kernel: 24 acc (6 rows × 4 quads), fits in 27 registers
+// 6x16 kernel: 24 acc (6 rows × 4 quads), 2x K-unrolling
+// 24 acc + 4 B = 28 SIMD regs. B reload reuses same 4 registers.
 // ------------------------------------------------------------------
 static void gemm_kernel_6x16(int K,
                               const float* A, int lda,
@@ -204,28 +231,70 @@ static void gemm_kernel_6x16(int K,
     const float *a0=A, *a1=A+lda, *a2=A+2*lda, *a3=A+3*lda,
                 *a4=A+4*lda, *a5=A+5*lda;
 
-    for (int k = 0; k < K; ++k) {
+    // 2x K-unrolled loop: two K iterations per loop, B regs reused
+    int k = 0;
+    for (; k + 1 < K; k += 2) {
+        // --- Iteration k ---
+        const float* bk0 = B + k * ldb;
+        float32x4_t b0 = vld1q_f32(bk0);
+        float32x4_t b1 = vld1q_f32(bk0 + 4);
+        float32x4_t b2 = vld1q_f32(bk0 + 8);
+        float32x4_t b3 = vld1q_f32(bk0 + 12);
+
+        float ak0=a0[k], ak1=a1[k], ak2=a2[k], ak3=a3[k], ak4=a4[k], ak5=a5[k];
+
+        a00=vfmaq_n_f32(a00,b0,ak0); a01=vfmaq_n_f32(a01,b1,ak0);
+        a02=vfmaq_n_f32(a02,b2,ak0); a03=vfmaq_n_f32(a03,b3,ak0);
+        a10=vfmaq_n_f32(a10,b0,ak1); a11=vfmaq_n_f32(a11,b1,ak1);
+        a12=vfmaq_n_f32(a12,b2,ak1); a13=vfmaq_n_f32(a13,b3,ak1);
+        a20=vfmaq_n_f32(a20,b0,ak2); a21=vfmaq_n_f32(a21,b1,ak2);
+        a22=vfmaq_n_f32(a22,b2,ak2); a23=vfmaq_n_f32(a23,b3,ak2);
+        a30=vfmaq_n_f32(a30,b0,ak3); a31=vfmaq_n_f32(a31,b1,ak3);
+        a32=vfmaq_n_f32(a32,b2,ak3); a33=vfmaq_n_f32(a33,b3,ak3);
+        a40=vfmaq_n_f32(a40,b0,ak4); a41=vfmaq_n_f32(a41,b1,ak4);
+        a42=vfmaq_n_f32(a42,b2,ak4); a43=vfmaq_n_f32(a43,b3,ak4);
+        a50=vfmaq_n_f32(a50,b0,ak5); a51=vfmaq_n_f32(a51,b1,ak5);
+        a52=vfmaq_n_f32(a52,b2,ak5); a53=vfmaq_n_f32(a53,b3,ak5);
+
+        // --- Iteration k+1 ---
+        const float* bk1 = B + (k+1) * ldb;
+        b0 = vld1q_f32(bk1);
+        b1 = vld1q_f32(bk1 + 4);
+        b2 = vld1q_f32(bk1 + 8);
+        b3 = vld1q_f32(bk1 + 12);
+
+        ak0=a0[k+1]; ak1=a1[k+1]; ak2=a2[k+1]; ak3=a3[k+1]; ak4=a4[k+1]; ak5=a5[k+1];
+
+        a00=vfmaq_n_f32(a00,b0,ak0); a01=vfmaq_n_f32(a01,b1,ak0);
+        a02=vfmaq_n_f32(a02,b2,ak0); a03=vfmaq_n_f32(a03,b3,ak0);
+        a10=vfmaq_n_f32(a10,b0,ak1); a11=vfmaq_n_f32(a11,b1,ak1);
+        a12=vfmaq_n_f32(a12,b2,ak1); a13=vfmaq_n_f32(a13,b3,ak1);
+        a20=vfmaq_n_f32(a20,b0,ak2); a21=vfmaq_n_f32(a21,b1,ak2);
+        a22=vfmaq_n_f32(a22,b2,ak2); a23=vfmaq_n_f32(a23,b3,ak2);
+        a30=vfmaq_n_f32(a30,b0,ak3); a31=vfmaq_n_f32(a31,b1,ak3);
+        a32=vfmaq_n_f32(a32,b2,ak3); a33=vfmaq_n_f32(a33,b3,ak3);
+        a40=vfmaq_n_f32(a40,b0,ak4); a41=vfmaq_n_f32(a41,b1,ak4);
+        a42=vfmaq_n_f32(a42,b2,ak4); a43=vfmaq_n_f32(a43,b3,ak4);
+        a50=vfmaq_n_f32(a50,b0,ak5); a51=vfmaq_n_f32(a51,b1,ak5);
+        a52=vfmaq_n_f32(a52,b2,ak5); a53=vfmaq_n_f32(a53,b3,ak5);
+    }
+    // K tail (odd K)
+    if (k < K) {
         const float* bk = B + k * ldb;
         float32x4_t b0 = vld1q_f32(bk);
         float32x4_t b1 = vld1q_f32(bk + 4);
         float32x4_t b2 = vld1q_f32(bk + 8);
         float32x4_t b3 = vld1q_f32(bk + 12);
-
         a00=vfmaq_n_f32(a00,b0,a0[k]); a01=vfmaq_n_f32(a01,b1,a0[k]);
         a02=vfmaq_n_f32(a02,b2,a0[k]); a03=vfmaq_n_f32(a03,b3,a0[k]);
-
         a10=vfmaq_n_f32(a10,b0,a1[k]); a11=vfmaq_n_f32(a11,b1,a1[k]);
         a12=vfmaq_n_f32(a12,b2,a1[k]); a13=vfmaq_n_f32(a13,b3,a1[k]);
-
         a20=vfmaq_n_f32(a20,b0,a2[k]); a21=vfmaq_n_f32(a21,b1,a2[k]);
         a22=vfmaq_n_f32(a22,b2,a2[k]); a23=vfmaq_n_f32(a23,b3,a2[k]);
-
         a30=vfmaq_n_f32(a30,b0,a3[k]); a31=vfmaq_n_f32(a31,b1,a3[k]);
         a32=vfmaq_n_f32(a32,b2,a3[k]); a33=vfmaq_n_f32(a33,b3,a3[k]);
-
         a40=vfmaq_n_f32(a40,b0,a4[k]); a41=vfmaq_n_f32(a41,b1,a4[k]);
         a42=vfmaq_n_f32(a42,b2,a4[k]); a43=vfmaq_n_f32(a43,b3,a4[k]);
-
         a50=vfmaq_n_f32(a50,b0,a5[k]); a51=vfmaq_n_f32(a51,b1,a5[k]);
         a52=vfmaq_n_f32(a52,b2,a5[k]); a53=vfmaq_n_f32(a53,b3,a5[k]);
     }
@@ -502,18 +571,18 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
     const auto& hw = detect_arm_hwcaps();
     auto tile = select_tile_fp32(M, N, K, hw.l1d.size_bytes);
 
-    // Find dispatch function
+    int Mr = tile.Mr;
+    int Nr = tile.Nr;
+
+    // Find dispatch kernel
     TileFn kernel_fn = nullptr;
     for (int d = 0; d < kNumTileDispatch; d++) {
-        if (kTileDispatch[d].Mr == tile.Mr && kTileDispatch[d].Nr == tile.Nr) {
+        if (kTileDispatch[d].Mr == Mr && kTileDispatch[d].Nr == Nr) {
             kernel_fn = kTileDispatch[d].fn;
             break;
         }
     }
     if (!kernel_fn) kernel_fn = gemm_tile_kernel_full<8, 12>;
-
-    int Mr = tile.Mr;
-    int Nr = tile.Nr;
 
     // N outer loop: full Nr-wide panels
     int j_full = (N / Nr) * Nr;
@@ -525,7 +594,8 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
                       C + i * ldc + j0, ldc,
                       alpha, beta);
         }
-        // M tail: use hand-written kernels for common sizes, fallback to alloca
+
+        // M tail
         if (i < M) {
             int m_rem = M - i;
             const float* At = A + i * lda;
