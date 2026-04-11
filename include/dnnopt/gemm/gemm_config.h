@@ -240,4 +240,31 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
                               const float* B, int ldb,
                               float beta, float* C, int ldc);
 
+// ============================================================
+// Phase 9: Inline assembly micro-kernels (autoGEMM-style)
+// ============================================================
+#ifdef __aarch64__
+
+void gemm_kernel_4x16_asm(int K, const float* A, int lda,
+                           const float* B, int ldb,
+                           float* C, int ldc,
+                           float alpha, float beta);
+
+void gemm_kernel_6x16_asm(int K, const float* A, int lda,
+                           const float* B, int ldb,
+                           float* C, int ldc,
+                           float alpha, float beta);
+
+void gemm_kernel_3x16_asm(int K, const float* A, int lda,
+                           const float* B, int ldb,
+                           float* C, int ldc,
+                           float alpha, float beta);
+
+void gemm_kernel_5x16_asm(int K, const float* A, int lda,
+                           const float* B, int ldb,
+                           float* C, int ldc,
+                           float alpha, float beta);
+
+#endif  // __aarch64__
+
 }  // namespace dnnopt

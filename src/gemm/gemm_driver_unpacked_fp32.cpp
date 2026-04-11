@@ -30,126 +30,124 @@ void gemm_smallK_fp32(int M, int N, int K,
                               float alpha, const float* A, int lda,
                               const float* B, int ldb,
                               float beta, float* C, int ldc) {
+    // Phase 11: Use 16-col panels via asm kernels for 4x FMA density.
+    // For K=4 with 4x16: 16 FMLAs/K vs old 4-col approach's 4 FMLAs/K.
+    constexpr int Nr = 16;
+
+#ifdef __aarch64__
+    // Select Mr based on M divisibility
+    int Mr = (M >= 6 && M % 6 >= M % 4) ? 6 : 4;
+
+    using KernelFn = void(*)(int, const float*, int, const float*, int,
+                             float*, int, float, float);
+    KernelFn main_kernel = (Mr == 6) ? gemm_kernel_6x16_asm : gemm_kernel_4x16_asm;
+
+    int j_full = (N / Nr) * Nr;
+
+    // N outer loop: full 16-col panels
+    for (int j0 = 0; j0 < j_full; j0 += Nr) {
+        int i = 0;
+        for (; i + Mr - 1 < M; i += Mr) {
+            main_kernel(K, A + i * lda, lda, B + j0, ldb,
+                        C + i * ldc + j0, ldc, alpha, beta);
+        }
+        // M-tail
+        if (i < M) {
+            int m_rem = M - i;
+            switch (m_rem) {
+            case 5: gemm_kernel_5x16_asm(K, A + i*lda, lda, B + j0, ldb, C + i*ldc + j0, ldc, alpha, beta); break;
+            case 4: gemm_kernel_4x16_asm(K, A + i*lda, lda, B + j0, ldb, C + i*ldc + j0, ldc, alpha, beta); break;
+            case 3: gemm_kernel_3x16_asm(K, A + i*lda, lda, B + j0, ldb, C + i*ldc + j0, ldc, alpha, beta); break;
+            default: {
+                // m_rem=1 or 2: use scalar/SIMD fallback for 16 cols
+                for (int r = 0; r < m_rem; ++r) {
+                    const float* Ar = A + (i + r) * lda;
+                    float* Cr = C + (i + r) * ldc + j0;
+                    float32x4_t c0 = vdupq_n_f32(0), c1 = vdupq_n_f32(0);
+                    float32x4_t c2 = vdupq_n_f32(0), c3 = vdupq_n_f32(0);
+                    for (int k = 0; k < K; ++k) {
+                        const float* bk = B + k * ldb + j0;
+                        float32x4_t av = vdupq_n_f32(Ar[k]);
+                        c0 = vfmaq_f32(c0, av, vld1q_f32(bk));
+                        c1 = vfmaq_f32(c1, av, vld1q_f32(bk + 4));
+                        c2 = vfmaq_f32(c2, av, vld1q_f32(bk + 8));
+                        c3 = vfmaq_f32(c3, av, vld1q_f32(bk + 12));
+                    }
+                    float32x4_t avf = vdupq_n_f32(alpha);
+                    if (beta == 0.0f) {
+                        vst1q_f32(Cr,      vmulq_f32(avf, c0));
+                        vst1q_f32(Cr + 4,  vmulq_f32(avf, c1));
+                        vst1q_f32(Cr + 8,  vmulq_f32(avf, c2));
+                        vst1q_f32(Cr + 12, vmulq_f32(avf, c3));
+                    } else {
+                        float32x4_t bvf = vdupq_n_f32(beta);
+                        vst1q_f32(Cr,      vfmaq_f32(vmulq_f32(bvf, vld1q_f32(Cr)),      avf, c0));
+                        vst1q_f32(Cr + 4,  vfmaq_f32(vmulq_f32(bvf, vld1q_f32(Cr + 4)),  avf, c1));
+                        vst1q_f32(Cr + 8,  vfmaq_f32(vmulq_f32(bvf, vld1q_f32(Cr + 8)),  avf, c2));
+                        vst1q_f32(Cr + 12, vfmaq_f32(vmulq_f32(bvf, vld1q_f32(Cr + 12)), avf, c3));
+                    }
+                }
+                break;
+            }
+            }
+        }
+    }
+
+    // N tail (< 16 cols): use 4-col-at-a-time intrinsics
+    if (j_full < N) {
+        int n_rem = N - j_full;
+        int n_full4 = (n_rem / 4) * 4;
+        float32x4_t av = vdupq_n_f32(alpha);
+        float32x4_t bvv = vdupq_n_f32(beta);
+        bool beta_zero = (beta == 0.0f);
+
+        for (int i = 0; i < M; ++i) {
+            const float* Ai = A + i * lda;
+            float* Ci = C + i * ldc + j_full;
+
+            for (int j = 0; j < n_full4; j += 4) {
+                float32x4_t c = vdupq_n_f32(0);
+                for (int k = 0; k < K; ++k)
+                    c = vfmaq_n_f32(c, vld1q_f32(B + k * ldb + j_full + j), Ai[k]);
+                float32x4_t s = vmulq_f32(av, c);
+                if (!beta_zero) s = vfmaq_f32(s, bvv, vld1q_f32(Ci + j));
+                vst1q_f32(Ci + j, s);
+            }
+            for (int j = n_full4; j < n_rem; ++j) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; ++k)
+                    sum += Ai[k] * B[k * ldb + j_full + j];
+                Ci[j] = beta_zero ? alpha * sum : alpha * sum + beta * Ci[j];
+            }
+        }
+    }
+#else
+    // Non-aarch64 fallback: original 4-col approach
     int n_full4 = (N / 4) * 4;
     float32x4_t av = vdupq_n_f32(alpha);
     float32x4_t bvv = vdupq_n_f32(beta);
     bool beta_zero = (beta == 0.0f);
 
-    // Process M in groups of 4
-    int i = 0;
-    for (; i + 3 < M; i += 4) {
-        const float* Ar[4] = {A + i*lda, A + (i+1)*lda, A + (i+2)*lda, A + (i+3)*lda};
-        float* Cr[4] = {C + i*ldc, C + (i+1)*ldc, C + (i+2)*ldc, C + (i+3)*ldc};
-
-        // Preload A values for all 4 rows (read once, reuse across all j-blocks)
-        float ap[4][16];
-        for (int k = 0; k < K; ++k)
-            for (int r = 0; r < 4; ++r)
-                ap[r][k] = Ar[r][k];
-
-        // Full N-blocks (j_len == 4): use direct SIMD stores
-        for (int j = 0; j < n_full4; j += 4) {
-            // Preload B[k, j..j+3]
-            float32x4_t bk[16];
-            for (int k = 0; k < K; ++k)
-                bk[k] = vld1q_f32(B + k * ldb + j);
-
-            float32x4_t c0 = vdupq_n_f32(0), c1 = vdupq_n_f32(0);
-            float32x4_t c2 = vdupq_n_f32(0), c3 = vdupq_n_f32(0);
-
-            for (int k = 0; k < K; ++k) {
-                c0 = vfmaq_n_f32(c0, bk[k], ap[0][k]);
-                c1 = vfmaq_n_f32(c1, bk[k], ap[1][k]);
-                c2 = vfmaq_n_f32(c2, bk[k], ap[2][k]);
-                c3 = vfmaq_n_f32(c3, bk[k], ap[3][k]);
-            }
-
-            // Direct SIMD store (j_len == 4 guaranteed)
-            float32x4_t s0 = vmulq_f32(av, c0);
-            float32x4_t s1 = vmulq_f32(av, c1);
-            float32x4_t s2 = vmulq_f32(av, c2);
-            float32x4_t s3 = vmulq_f32(av, c3);
-            if (!beta_zero) {
-                s0 = vfmaq_f32(s0, bvv, vld1q_f32(Cr[0] + j));
-                s1 = vfmaq_f32(s1, bvv, vld1q_f32(Cr[1] + j));
-                s2 = vfmaq_f32(s2, bvv, vld1q_f32(Cr[2] + j));
-                s3 = vfmaq_f32(s3, bvv, vld1q_f32(Cr[3] + j));
-            }
-            vst1q_f32(Cr[0] + j, s0);
-            vst1q_f32(Cr[1] + j, s1);
-            vst1q_f32(Cr[2] + j, s2);
-            vst1q_f32(Cr[3] + j, s3);
-        }
-
-        // N tail (< 4 cols)
-        for (int j = n_full4; j < N; ) {
-            int j_len = std::min(4, N - j);
-            float32x4_t bk[16];
-            for (int k = 0; k < K; ++k)
-                bk[k] = vld1q_f32(B + k * ldb + j);
-
-            float32x4_t c0 = vdupq_n_f32(0), c1 = vdupq_n_f32(0);
-            float32x4_t c2 = vdupq_n_f32(0), c3 = vdupq_n_f32(0);
-            for (int k = 0; k < K; ++k) {
-                c0 = vfmaq_n_f32(c0, bk[k], ap[0][k]);
-                c1 = vfmaq_n_f32(c1, bk[k], ap[1][k]);
-                c2 = vfmaq_n_f32(c2, bk[k], ap[2][k]);
-                c3 = vfmaq_n_f32(c3, bk[k], ap[3][k]);
-            }
-            float32x4_t s0 = vmulq_f32(av, c0), s1 = vmulq_f32(av, c1);
-            float32x4_t s2 = vmulq_f32(av, c2), s3 = vmulq_f32(av, c3);
-            float tmp0[4], tmp1[4], tmp2[4], tmp3[4];
-            vst1q_f32(tmp0, s0); vst1q_f32(tmp1, s1);
-            vst1q_f32(tmp2, s2); vst1q_f32(tmp3, s3);
-            for (int jj = 0; jj < j_len; ++jj) {
-                Cr[0][j+jj] = beta_zero ? tmp0[jj] : tmp0[jj] + beta * Cr[0][j+jj];
-                Cr[1][j+jj] = beta_zero ? tmp1[jj] : tmp1[jj] + beta * Cr[1][j+jj];
-                Cr[2][j+jj] = beta_zero ? tmp2[jj] : tmp2[jj] + beta * Cr[2][j+jj];
-                Cr[3][j+jj] = beta_zero ? tmp3[jj] : tmp3[jj] + beta * Cr[3][j+jj];
-            }
-            j += j_len;
-        }
-    }
-
-    // Handle remaining rows (< 4)
-    for (; i < M; ++i) {
+    for (int i = 0; i < M; ++i) {
         const float* Ai = A + i * lda;
         float* Ci = C + i * ldc;
 
-        // Preload A for this row
-        float ap1[16];
-        for (int k = 0; k < K; ++k) ap1[k] = Ai[k];
-
         for (int j = 0; j < n_full4; j += 4) {
-            float32x4_t bk[16];
-            for (int k = 0; k < K; ++k)
-                bk[k] = vld1q_f32(B + k * ldb + j);
-
             float32x4_t c = vdupq_n_f32(0);
             for (int k = 0; k < K; ++k)
-                c = vfmaq_n_f32(c, bk[k], ap1[k]);
-
+                c = vfmaq_n_f32(c, vld1q_f32(B + k * ldb + j), Ai[k]);
             float32x4_t s = vmulq_f32(av, c);
             if (!beta_zero) s = vfmaq_f32(s, bvv, vld1q_f32(Ci + j));
             vst1q_f32(Ci + j, s);
         }
-        for (int j = n_full4; j < N; ) {
-            int j_len = std::min(4, N - j);
-            float32x4_t bk[16];
+        for (int j = n_full4; j < N; ++j) {
+            float sum = 0.0f;
             for (int k = 0; k < K; ++k)
-                bk[k] = vld1q_f32(B + k * ldb + j);
-
-            float32x4_t c = vdupq_n_f32(0);
-            for (int k = 0; k < K; ++k)
-                c = vfmaq_n_f32(c, bk[k], ap1[k]);
-
-            float tmp[4];
-            vst1q_f32(tmp, vmulq_f32(av, c));
-            for (int jj = 0; jj < j_len; ++jj)
-                Ci[j+jj] = beta_zero ? tmp[jj] : tmp[jj] + beta * Ci[j+jj];
-            j += j_len;
+                sum += Ai[k] * B[k * ldb + j];
+            Ci[j] = beta_zero ? alpha * sum : alpha * sum + beta * Ci[j];
         }
     }
+#endif
 }
 
 // ============================================================

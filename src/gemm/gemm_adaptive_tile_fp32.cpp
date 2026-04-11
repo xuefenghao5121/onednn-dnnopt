@@ -498,10 +498,19 @@ struct TileDispatch {
 };
 
 static const TileDispatch kTileDispatch[] = {
+#ifdef __aarch64__
+    // Phase 9: inline assembly kernels (autoGEMM-style)
+    { 3, 16, gemm_kernel_3x16_asm },
+    { 4, 16, gemm_kernel_4x16_asm },
+    { 5, 16, gemm_kernel_5x16_asm },
+    { 6, 16, gemm_kernel_6x16_asm },
+#else
+    // Fallback: NEON intrinsics kernels
     { 3, 16, gemm_kernel_3x16 },
     { 4, 16, gemm_kernel_4x16 },
     { 5, 16, gemm_kernel_5x16 },
     { 6, 16, gemm_kernel_6x16 },
+#endif
     { 4, 12, gemm_tile_kernel_full<4, 12> },
     { 8, 12, gemm_tile_kernel_full<8, 12> },
     { 8,  8, gemm_tile_kernel_full<8,  8> },
@@ -584,49 +593,83 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
     }
     if (!kernel_fn) kernel_fn = gemm_tile_kernel_full<8, 12>;
 
+    // Phase 10: Kc blocking for large K.
+    // Target: A[Mr][Kc] + B[Kc][Nr] fit in L1D (64KB on N2).
+    // For 6x16: (6+16)*Kc*4 ≤ 64KB → Kc ≤ 744, round to 512.
+    // For small K (≤ Kc), this is a no-op (single iteration).
+    uint32_t l1d = hw.l1d.size_bytes;
+    if (l1d == 0) l1d = 64 * 1024;
+    int Kc = (int)(l1d * 4 / 5) / ((Mr + Nr) * (int)sizeof(float));
+    Kc = std::max(Kc, 1);
+    Kc = std::min(Kc, K);
+
     // N outer loop: full Nr-wide panels
     int j_full = (N / Nr) * Nr;
     for (int j0 = 0; j0 < j_full; j0 += Nr) {
         int i = 0;
         for (; i + Mr - 1 < M; i += Mr) {
-            kernel_fn(K, A + i * lda, lda,
-                      B + j0, ldb,
-                      C + i * ldc + j0, ldc,
-                      alpha, beta);
+            // Kc blocking: alpha for all blocks, beta for first, 1.0 for rest
+            for (int pc = 0; pc < K; pc += Kc) {
+                int kc = std::min(Kc, K - pc);
+                float beta_k = (pc == 0) ? beta : 1.0f;
+                kernel_fn(kc, A + i * lda + pc, lda,
+                          B + pc * ldb + j0, ldb,
+                          C + i * ldc + j0, ldc,
+                          alpha, beta_k);
+            }
         }
 
-        // M tail
+        // M tail with Kc blocking
         if (i < M) {
             int m_rem = M - i;
             const float* At = A + i * lda;
             float* Ct = C + i * ldc + j0;
-            if (Nr == 16) {
-                switch (m_rem) {
-                case 3: gemm_kernel_3x16(K, At, lda, B+j0, ldb, Ct, ldc, alpha, beta); break;
-                case 5: gemm_kernel_5x16(K, At, lda, B+j0, ldb, Ct, ldc, alpha, beta); break;
-                default: gemm_tile_tail(m_rem, Nr, K, alpha, At, lda, B+j0, ldb, beta, Ct, ldc); break;
+            for (int pc = 0; pc < K; pc += Kc) {
+                int kc = std::min(Kc, K - pc);
+                float beta_k = (pc == 0) ? beta : 1.0f;
+                const float* At_k = At + pc;
+                const float* Bt_k = B + pc * ldb + j0;
+                if (Nr == 16) {
+                    switch (m_rem) {
+#ifdef __aarch64__
+                    case 3: gemm_kernel_3x16_asm(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+                    case 5: gemm_kernel_5x16_asm(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+#else
+                    case 3: gemm_kernel_3x16(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+                    case 5: gemm_kernel_5x16(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+#endif
+                    default: gemm_tile_tail(m_rem, Nr, kc, alpha, At_k, lda, Bt_k, ldb, beta_k, Ct, ldc); break;
+                    }
+                } else {
+                    gemm_tile_tail(m_rem, Nr, kc, alpha, At_k, lda, Bt_k, ldb, beta_k, Ct, ldc);
                 }
-            } else {
-                gemm_tile_tail(m_rem, Nr, K, alpha, At, lda, B+j0, ldb, beta, Ct, ldc);
             }
         }
     }
 
-    // N tail: partial panel
+    // N tail: partial panel with Kc blocking
     if (j_full < N) {
         int n_len = N - j_full;
         int i = 0;
         for (; i + Mr - 1 < M; i += Mr) {
-            gemm_tile_tail(Mr, n_len, K, alpha,
-                           A + i * lda, lda,
-                           B + j_full, ldb,
-                           beta, C + i * ldc + j_full, ldc);
+            for (int pc = 0; pc < K; pc += Kc) {
+                int kc = std::min(Kc, K - pc);
+                float beta_k = (pc == 0) ? beta : 1.0f;
+                gemm_tile_tail(Mr, n_len, kc, alpha,
+                               A + i * lda + pc, lda,
+                               B + pc * ldb + j_full, ldb,
+                               beta_k, C + i * ldc + j_full, ldc);
+            }
         }
         if (i < M) {
-            gemm_tile_tail(M - i, n_len, K, alpha,
-                           A + i * lda, lda,
-                           B + j_full, ldb,
-                           beta, C + i * ldc + j_full, ldc);
+            for (int pc = 0; pc < K; pc += Kc) {
+                int kc = std::min(Kc, K - pc);
+                float beta_k = (pc == 0) ? beta : 1.0f;
+                gemm_tile_tail(M - i, n_len, kc, alpha,
+                               A + i * lda + pc, lda,
+                               B + pc * ldb + j_full, ldb,
+                               beta_k, C + i * ldc + j_full, ldc);
+            }
         }
     }
 }

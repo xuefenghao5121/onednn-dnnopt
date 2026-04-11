@@ -138,7 +138,9 @@ void gemm_fp32(int M, int N, int K,
 #endif
 
         // Small-M uses dedicated fast path (no packing)
-        if (M < kGemmMrFp32) {
+        // Phase 9: M=4..7 can now use adaptive tile (asm kernels),
+        // so only route M=1..3 to smallm drivers unconditionally.
+        if (M < 4) {
 #ifdef __ARM_NEON
             if (M == 1) {
                 gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
@@ -156,10 +158,13 @@ void gemm_fp32(int M, int N, int K,
             return;
         }
 
-        // Phase 8: adaptive tile GEMM (autoGEMM-style, unpacked)
-        // Only for small vol where packing overhead dominates compute.
-        // Medium/large vol uses registry (packed) path for better cache behavior.
-        if ((int64_t)M * N * K < kUnpackedFlopsThreshold && M >= 4) {
+        // Phase 8/10/11: adaptive tile GEMM (autoGEMM-style, unpacked + Kc blocking)
+        // Use for: (a) small vol shapes (packing overhead > compute), OR
+        // (b) M=4-7 — asm kernels outperform packed 8x12 which zero-pads M to 8.
+        if (M >= 4 && (
+            (int64_t)M * N * K < kUnpackedFlopsThreshold ||
+            M < 8
+        )) {
             gemm_adaptive_tile_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
             return;
         }
@@ -173,14 +178,16 @@ void gemm_fp32(int M, int N, int K,
     // Explicit NEON or fallback from registry
 #ifdef __ARM_NEON
     if (algo == GemmAlgo::kNeonFp32 || algo == GemmAlgo::kAuto) {
-        if (M < kGemmMrFp32) {
+        if (M < 4) {
             if (M == 1)
                 gemm_smallm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
             else
                 gemm_smallm_wide_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else if (K <= 16) {
             gemm_smallK_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        } else if ((int64_t)M * N * K < kUnpackedFlopsThreshold && M >= 4) {
+        } else if (M >= 4 && (
+                   (int64_t)M * N * K < kUnpackedFlopsThreshold ||
+                   M < 8)) {
             gemm_adaptive_tile_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         } else {
             gemm_driver_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);

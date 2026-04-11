@@ -15,6 +15,8 @@ add_library(dnnopt_core STATIC
     gemm/gemm_smallm_fp32_v2.cpp
     gemm/gemm_smallm_wide_fp32.cpp
     gemm/gemm_adaptive_tile_fp32.cpp
+    gemm/gemm_kernel_asm_fp32.cpp
+    gemm/gemm_ukernel_fp32_asm.cpp
     gemm/gemm_driver_unpacked_fp32.cpp
     gemm/gemm_tiny_fp32.cpp
     gemm/gemm_sme.cpp

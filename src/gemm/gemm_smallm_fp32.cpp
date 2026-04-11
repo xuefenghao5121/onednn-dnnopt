@@ -447,39 +447,66 @@ static void gemm_ukernel_fp32_4xN(int N, int K,
 // Small-M drivers
 // ============================================================
 
-/// M=1 driver: optimized GEMV with panel-based processing.
-/// Processes N in panels of 64 for L1 cache efficiency.
+/// M=1 driver: optimized GEMV with panel-based processing + Kc blocking.
+///
+/// Phase 11: Added Kc blocking for cache-friendly B access.
+/// For K=4096 with kPanelN=128: B per panel = K*128*4 = 2MB without blocking.
+/// With Kc=128: B per block = 128*128*4 = 64KB, fits L1D exactly.
+/// Accumulators persist across Kc blocks (no alpha/beta complication).
 static void gemm_smallm1_fp32(int N, int K,
                                float alpha, const float* A, int lda,
                                const float* B, int ldb,
                                float beta, float* C, int ldc) {
     (void)lda; (void)ldc;  // M=1, stride not needed
-    constexpr int kPanelN = 64;
+
+    constexpr int kPanelN = 128;
+    // Kc blocking: target B[Kc][panelN] fits L1D.
+    // L1D=64KB, panelN=128: Kc = 64KB / (128*4) = 128.
+    constexpr int kKc = 128;
 
     for (int j0 = 0; j0 < N; j0 += kPanelN) {
         int j_len = std::min(kPanelN, N - j0);
+        int j_full4 = (j_len / 4) * 4;
 
-        // Initialize accumulators (16 SIMD vectors = 64 floats)
-        float32x4_t acc[16];
-        for (int i = 0; i < 16; ++i) acc[i] = vdupq_n_f32(0);
+        // 32 accumulators for 128 floats — persist across Kc blocks
+        float32x4_t acc[32];
+        for (int i = 0; i < 32; ++i) acc[i] = vdupq_n_f32(0);
 
-        // K-loop: each 4-wide segment of N uses its own accumulator
-        // acc[i] corresponds to columns [4i, 4i+3] within this panel
-        for (int k = 0; k < K; ++k) {
-            float ak = A[k];
-            float32x4_t av = vdupq_n_f32(ak);
-            const float* bk = B + k * ldb + j0;
+        // Kc blocking: process K in cache-friendly chunks
+        for (int pc = 0; pc < K; pc += kKc) {
+            int kc = std::min(kKc, K - pc);
 
-            for (int j = 0; j + 3 < j_len; j += 4) {
-                int idx = j / 4;  // accumulator index: 0..15
-                acc[idx] = vfmaq_f32(acc[idx], av, vld1q_f32(bk + j));
+            // 2x K-unrolled main loop within this Kc block
+            int k = 0;
+            for (; k + 1 < kc; k += 2) {
+                float ak0 = A[pc + k], ak1 = A[pc + k + 1];
+                float32x4_t av0 = vdupq_n_f32(ak0);
+                float32x4_t av1 = vdupq_n_f32(ak1);
+                const float* bk0 = B + (pc + k) * ldb + j0;
+                const float* bk1 = B + (pc + k + 1) * ldb + j0;
+
+                for (int j = 0; j < j_full4; j += 4) {
+                    int idx = j / 4;
+                    acc[idx] = vfmaq_f32(acc[idx], av0, vld1q_f32(bk0 + j));
+                    acc[idx] = vfmaq_f32(acc[idx], av1, vld1q_f32(bk1 + j));
+                }
+            }
+            // K tail within this Kc block
+            if (k < kc) {
+                float ak = A[pc + k];
+                float32x4_t av = vdupq_n_f32(ak);
+                const float* bk = B + (pc + k) * ldb + j0;
+                for (int j = 0; j < j_full4; j += 4) {
+                    int idx = j / 4;
+                    acc[idx] = vfmaq_f32(acc[idx], av, vld1q_f32(bk + j));
+                }
             }
         }
 
-        // Store: each accumulator maps to its 4-wide segment
+        // Store
         float32x4_t av = vdupq_n_f32(alpha);
         float32x4_t bv = vdupq_n_f32(beta);
-        for (int j = 0; j + 3 < j_len; j += 4) {
+        for (int j = 0; j < j_full4; j += 4) {
             int idx = j / 4;
             if (beta == 0.0f) {
                 vst1q_f32(C + j0 + j, vmulq_f32(av, acc[idx]));
@@ -487,11 +514,11 @@ static void gemm_smallm1_fp32(int N, int K,
                 vst1q_f32(C + j0 + j, vfmaq_f32(vmulq_f32(bv, vld1q_f32(C + j0 + j)), av, acc[idx]));
             }
         }
-        // Scalar tail for N remainder (< 4)
-        for (int j = (j_len / 4) * 4; j < j_len; ++j) {
+        // Scalar tail
+        for (int j = j_full4; j < j_len; ++j) {
             float sum = 0.0f;
-            for (int k = 0; k < K; ++k) {
-                sum += A[k] * B[k * ldb + j0 + j];
+            for (int k2 = 0; k2 < K; ++k2) {
+                sum += A[k2] * B[k2 * ldb + j0 + j];
             }
             C[j0 + j] = (beta == 0.0f) ? alpha * sum : alpha * sum + beta * C[j0 + j];
         }
