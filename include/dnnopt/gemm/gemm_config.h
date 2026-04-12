@@ -265,6 +265,22 @@ void gemm_kernel_5x16_asm(int K, const float* A, int lda,
                            float* C, int ldc,
                            float alpha, float beta);
 
+// Phase 13: Clang .s[N] optimized npo2 kernels (vector A loads)
+void gemm_kernel_3x16_lane(int K, const float* A, int lda,
+                            const float* B, int ldb,
+                            float* C, int ldc,
+                            float alpha, float beta);
+
+void gemm_kernel_5x16_lane(int K, const float* A, int lda,
+                            const float* B, int ldb,
+                            float* C, int ldc,
+                            float alpha, float beta);
+
+void gemm_kernel_7x16_lane(int K, const float* A, int lda,
+                            const float* B, int ldb,
+                            float* C, int ldc,
+                            float alpha, float beta);
+
 #endif  // __aarch64__
 
 }  // namespace dnnopt

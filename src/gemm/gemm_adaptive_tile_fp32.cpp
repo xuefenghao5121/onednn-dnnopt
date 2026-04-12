@@ -519,11 +519,12 @@ struct TileDispatch {
 
 static const TileDispatch kTileDispatch[] = {
 #ifdef __aarch64__
-    // Phase 9: inline assembly kernels (autoGEMM-style)
-    { 3, 16, gemm_kernel_3x16_asm },
+    // Phase 13: Clang .s[N] vectorized kernels (4x K-unroll, vector A loads)
+    { 3, 16, gemm_kernel_3x16_lane },
     { 4, 16, gemm_kernel_4x16_asm },
-    { 5, 16, gemm_kernel_5x16_asm },
+    { 5, 16, gemm_kernel_5x16_lane },
     { 6, 16, gemm_kernel_6x16_asm },
+    { 7, 16, gemm_kernel_7x16_lane },
 #else
     // Fallback: NEON intrinsics kernels
     { 3, 16, gemm_kernel_3x16 },
@@ -666,8 +667,9 @@ void gemm_adaptive_tile_fp32(int M, int N, int K,
                 if (Nr == 16) {
                     switch (m_rem) {
 #ifdef __aarch64__
-                    case 3: gemm_kernel_3x16_asm(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
-                    case 5: gemm_kernel_5x16_asm(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+                    case 3: gemm_kernel_3x16_lane(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+                    case 5: gemm_kernel_5x16_lane(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
+                    case 7: gemm_kernel_7x16_lane(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
 #else
                     case 3: gemm_kernel_3x16(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
                     case 5: gemm_kernel_5x16(kc, At_k, lda, Bt_k, ldb, Ct, ldc, alpha, beta_k); break;
