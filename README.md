@@ -1,6 +1,6 @@
 # DNN-Opt: oneDNN Supplementary Patch for ARM Inference
 
-**Version: 0.9.12** | **Status: Production-ready patch for oneDNN**
+**Version: 0.9.13** | **Status: Production-ready patch for oneDNN**
 
 ARM 平台推理优化库，以 **oneDNN 补丁** 的形式提供，专注于补齐 oneDNN 在小型矩阵和奇异形状上的性能弱点。无需替换 oneDNN，只需 patch 即可自动获得加速。
 
@@ -154,6 +154,16 @@ onednn-arm-opt/
 | A64FX | ARMv8.2-SVE | 512-bit SVE | HBM2 |
 
 ## Development Log
+
+### v0.9.13 — Phase 13I+C: M=6 Packed Path + Vectorized N-Tail (2026-04-13)
+
+M=6 大形状 packed 路径 + 不规则 N-tail 全面向量化。
+
+- **Packed 6x16 内核**: 注册到 kernel registry，M=6 形状可用 packed+threaded 路径
+- **M=6 大形状路由**: N*K > 4M 时通过 8x16 M-padding 走 packed 路径（cache-friendly B 访问）
+- **N-tail 向量化**: gemm_tile_tail 全面向量化，消除 scalar K-loop fallback
+- **edge_buf 优化**: 移除 generic driver 中不必要的 memset
+- **结果**: 54/1 wins vs oneDNN, M16_N23 1.28→1.68x, M32_N47 1.63→1.95x
 
 ### v0.9.12 — Phase 13H: Small/Irregular Matrix Optimization (2026-04-13)
 
