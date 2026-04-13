@@ -371,6 +371,193 @@ void gemm_tiny_block_fp32(int M, int N, int K,
 }
 
 // ============================================================
+// Tall-skinny: M arbitrary, N=2..7
+// Each row computes a small N-element result from K-element dot products.
+// Process 4 rows at a time for ILP. N outputs fit in one NEON register.
+// ============================================================
+
+/// Load N floats from B row into a float32x4_t (zero-padded).
+/// N is a compile-time constant (2, 3, or 4).
+template<int N>
+static inline float32x4_t load_b_narrow(const float* ptr) {
+    // Use scalar array to avoid vsetq_lane with variable index
+    float vals[4] = {0, 0, 0, 0};
+    for (int i = 0; i < N; i++) vals[i] = ptr[i];
+    return vld1q_f32(vals);
+}
+
+/// Tall-skinny GEMM for N=2,3,4.
+/// For N=4: each row's output is exactly one float32x4_t.
+/// Process 4 rows simultaneously for ILP.
+template<int N>
+static void gemm_tall_skinny_n4(int M, int K,
+                                 float alpha, const float* A, int lda,
+                                 const float* B, int ldb,
+                                 float beta, float* C, int ldc) {
+    // Process 4 rows at a time
+    int i = 0;
+    for (; i + 3 < M; i += 4) {
+        const float* a0 = A + i * lda;
+        const float* a1 = A + (i + 1) * lda;
+        const float* a2 = A + (i + 2) * lda;
+        const float* a3 = A + (i + 3) * lda;
+
+        float32x4_t s0 = vdupq_n_f32(0), s1 = vdupq_n_f32(0);
+        float32x4_t s2 = vdupq_n_f32(0), s3 = vdupq_n_f32(0);
+
+        int k = 0;
+        for (; k + 3 < K; k += 4) {
+            // Load B[k+0..3, 0..N-1] — N columns padded to 4
+            float32x4_t bk0 = load_b_narrow<N>(B + (k+0)*ldb);
+            float32x4_t bk1 = load_b_narrow<N>(B + (k+1)*ldb);
+            float32x4_t bk2 = load_b_narrow<N>(B + (k+2)*ldb);
+            float32x4_t bk3 = load_b_narrow<N>(B + (k+3)*ldb);
+
+            float32x4_t av = {a0[k], a0[k+1], a0[k+2], a0[k+3]};
+            s0 = vfmaq_laneq_f32(s0, bk0, av, 0);
+            s0 = vfmaq_laneq_f32(s0, bk1, av, 1);
+            s0 = vfmaq_laneq_f32(s0, bk2, av, 2);
+            s0 = vfmaq_laneq_f32(s0, bk3, av, 3);
+
+            av = {a1[k], a1[k+1], a1[k+2], a1[k+3]};
+            s1 = vfmaq_laneq_f32(s1, bk0, av, 0);
+            s1 = vfmaq_laneq_f32(s1, bk1, av, 1);
+            s1 = vfmaq_laneq_f32(s1, bk2, av, 2);
+            s1 = vfmaq_laneq_f32(s1, bk3, av, 3);
+
+            av = {a2[k], a2[k+1], a2[k+2], a2[k+3]};
+            s2 = vfmaq_laneq_f32(s2, bk0, av, 0);
+            s2 = vfmaq_laneq_f32(s2, bk1, av, 1);
+            s2 = vfmaq_laneq_f32(s2, bk2, av, 2);
+            s2 = vfmaq_laneq_f32(s2, bk3, av, 3);
+
+            av = {a3[k], a3[k+1], a3[k+2], a3[k+3]};
+            s3 = vfmaq_laneq_f32(s3, bk0, av, 0);
+            s3 = vfmaq_laneq_f32(s3, bk1, av, 1);
+            s3 = vfmaq_laneq_f32(s3, bk2, av, 2);
+            s3 = vfmaq_laneq_f32(s3, bk3, av, 3);
+        }
+
+        // K tail
+        for (; k < K; k++) {
+            float32x4_t bk = load_b_narrow<N>(B + k*ldb);
+            s0 = vfmaq_n_f32(s0, bk, a0[k]);
+            s1 = vfmaq_n_f32(s1, bk, a1[k]);
+            s2 = vfmaq_n_f32(s2, bk, a2[k]);
+            s3 = vfmaq_n_f32(s3, bk, a3[k]);
+        }
+
+        // Store results
+        float32x4_t av = vdupq_n_f32(alpha);
+        float out0[4], out1[4], out2[4], out3[4];
+        vst1q_f32(out0, vmulq_f32(av, s0));
+        vst1q_f32(out1, vmulq_f32(av, s1));
+        vst1q_f32(out2, vmulq_f32(av, s2));
+        vst1q_f32(out3, vmulq_f32(av, s3));
+
+        for (int n = 0; n < N; n++) {
+            C[i * ldc + n]       = (beta == 0.0f) ? out0[n] : out0[n] + beta * C[i * ldc + n];
+            C[(i+1) * ldc + n]   = (beta == 0.0f) ? out1[n] : out1[n] + beta * C[(i+1) * ldc + n];
+            C[(i+2) * ldc + n]   = (beta == 0.0f) ? out2[n] : out2[n] + beta * C[(i+2) * ldc + n];
+            C[(i+3) * ldc + n]   = (beta == 0.0f) ? out3[n] : out3[n] + beta * C[(i+3) * ldc + n];
+        }
+    }
+
+    // Remaining rows (1-3)
+    for (; i < M; i++) {
+        const float* ai = A + i * lda;
+        float32x4_t si = vdupq_n_f32(0);
+        int k = 0;
+        for (; k + 3 < K; k += 4) {
+            float32x4_t bk0 = load_b_narrow<N>(B + (k+0)*ldb);
+            float32x4_t bk1 = load_b_narrow<N>(B + (k+1)*ldb);
+            float32x4_t bk2 = load_b_narrow<N>(B + (k+2)*ldb);
+            float32x4_t bk3 = load_b_narrow<N>(B + (k+3)*ldb);
+            float32x4_t av = {ai[k], ai[k+1], ai[k+2], ai[k+3]};
+            si = vfmaq_laneq_f32(si, bk0, av, 0);
+            si = vfmaq_laneq_f32(si, bk1, av, 1);
+            si = vfmaq_laneq_f32(si, bk2, av, 2);
+            si = vfmaq_laneq_f32(si, bk3, av, 3);
+        }
+        for (; k < K; k++) {
+            float32x4_t bk = load_b_narrow<N>(B + k*ldb);
+            si = vfmaq_n_f32(si, bk, ai[k]);
+        }
+        float32x4_t av = vdupq_n_f32(alpha);
+        float out[4];
+        vst1q_f32(out, vmulq_f32(av, si));
+        for (int n = 0; n < N; n++)
+            C[i * ldc + n] = (beta == 0.0f) ? out[n] : out[n] + beta * C[i * ldc + n];
+    }
+}
+
+/// Load N2 floats from B+OFFSET into a float32x4_t (zero-padded).
+/// N2 is 1-3, OFFSET is 4.
+template<int N2>
+static inline float32x4_t load_b_tail(const float* ptr) {
+    float vals[4] = {0, 0, 0, 0};
+    if (N2 >= 1) vals[0] = ptr[0];
+    if (N2 >= 2) vals[1] = ptr[1];
+    if (N2 >= 3) vals[2] = ptr[2];
+    return vld1q_f32(vals);
+}
+
+/// Tall-skinny GEMM for N=5,6,7.
+/// Uses 2 N-passes: first 4 columns, then remaining 1-3.
+template<int N>
+static void gemm_tall_skinny_n7(int M, int K,
+                                 float alpha, const float* A, int lda,
+                                 const float* B, int ldb,
+                                 float beta, float* C, int ldc) {
+    constexpr int N2 = N - 4;
+
+    for (int i = 0; i < M; i++) {
+        const float* ai = A + i * lda;
+        float32x4_t s1 = vdupq_n_f32(0);
+        float32x4_t s2 = vdupq_n_f32(0);
+
+        int k = 0;
+        for (; k + 3 < K; k += 4) {
+            // First 4 columns
+            float32x4_t bk0 = load_b_narrow<4>(B + (k+0)*ldb);
+            float32x4_t bk1 = load_b_narrow<4>(B + (k+1)*ldb);
+            float32x4_t bk2 = load_b_narrow<4>(B + (k+2)*ldb);
+            float32x4_t bk3 = load_b_narrow<4>(B + (k+3)*ldb);
+            // Remaining columns (4..N-1)
+            float32x4_t bt0 = load_b_tail<N2>(B + (k+0)*ldb + 4);
+            float32x4_t bt1 = load_b_tail<N2>(B + (k+1)*ldb + 4);
+            float32x4_t bt2 = load_b_tail<N2>(B + (k+2)*ldb + 4);
+            float32x4_t bt3 = load_b_tail<N2>(B + (k+3)*ldb + 4);
+
+            float32x4_t av = {ai[k], ai[k+1], ai[k+2], ai[k+3]};
+            s1 = vfmaq_laneq_f32(s1, bk0, av, 0);
+            s1 = vfmaq_laneq_f32(s1, bk1, av, 1);
+            s1 = vfmaq_laneq_f32(s1, bk2, av, 2);
+            s1 = vfmaq_laneq_f32(s1, bk3, av, 3);
+            s2 = vfmaq_laneq_f32(s2, bt0, av, 0);
+            s2 = vfmaq_laneq_f32(s2, bt1, av, 1);
+            s2 = vfmaq_laneq_f32(s2, bt2, av, 2);
+            s2 = vfmaq_laneq_f32(s2, bt3, av, 3);
+        }
+        for (; k < K; k++) {
+            float32x4_t bk1 = load_b_narrow<4>(B + k*ldb);
+            float32x4_t bk2 = load_b_tail<N2>(B + k*ldb + 4);
+            s1 = vfmaq_n_f32(s1, bk1, ai[k]);
+            s2 = vfmaq_n_f32(s2, bk2, ai[k]);
+        }
+
+        float32x4_t av = vdupq_n_f32(alpha);
+        float o1[4], o2[4];
+        vst1q_f32(o1, vmulq_f32(av, s1));
+        vst1q_f32(o2, vmulq_f32(av, s2));
+        for (int n = 0; n < 4; n++)
+            C[i*ldc+n] = (beta == 0.0f) ? o1[n] : o1[n] + beta*C[i*ldc+n];
+        for (int n = 0; n < N2; n++)
+            C[i*ldc+4+n] = (beta == 0.0f) ? o2[n] : o2[n] + beta*C[i*ldc+4+n];
+    }
+}
+
+// ============================================================
 // Public dispatch entry point
 // ============================================================
 
@@ -401,6 +588,27 @@ bool gemm_tiny_dispatch_fp32(int M, int N, int K,
     // Small blocks: M,N ≤ 8
     if (M <= 8 && N <= 8) {
         gemm_small_mn_fp32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        return true;
+    }
+
+    // Tall-skinny: M > 8, N ≤ 4 (e.g., M=128, N=2)
+    // Avoids packing overhead and N-tail waste from 8x12 registry kernels.
+    if (N <= 4 && M > 8) {
+        switch (N) {
+        case 2: gemm_tall_skinny_n4<2>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        case 3: gemm_tall_skinny_n4<3>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        case 4: gemm_tall_skinny_n4<4>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        }
+        return true;
+    }
+
+    // Tall-skinny: M > 8, N=5..7
+    if (N <= 7 && N > 4 && M > 8) {
+        switch (N) {
+        case 5: gemm_tall_skinny_n7<5>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        case 6: gemm_tall_skinny_n7<6>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        case 7: gemm_tall_skinny_n7<7>(M, K, alpha, A, lda, B, ldb, beta, C, ldc); break;
+        }
         return true;
     }
 

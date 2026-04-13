@@ -155,8 +155,10 @@ void gemm_fp32(int M, int N, int K,
             // This enables 2D threading + huge pages, which outperforms small-M
             // wide driver for shapes like batch4-LLM (4×4096×4096).
             // Threshold: N*K > 4M (e.g., N=4096, K>=1024 or N>=1024, K=4096)
+            // Only when M matches a registry kernel Mr (4 or 8) to avoid tail waste.
+            // M=5,6,7 use adaptive tile kernels (5x16, 6x16, 7x16) instead.
             constexpr int64_t kLargeNKThreshold = 4 * 1024 * 1024;
-            if (M >= 4 && (int64_t)N * K > kLargeNKThreshold) {
+            if (M == 4 && (int64_t)N * K > kLargeNKThreshold) {
                 // Fall through to registry dispatch (packed + threaded)
                 goto registry_dispatch;
             }
