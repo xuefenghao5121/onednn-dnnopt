@@ -212,14 +212,14 @@ bazel build --config=mkl_aarch64_threadpool --linkopt=-fuse-ld=lld ...
 
 | Model/Layer | Shape | dnnopt GF | upstream GF | Speedup |
 |-------------|-------|-----------|-------------|---------|
-| CVR embedding b1 | [1,256,1024] | 11.92 | 4.48 | **2.7x** |
-| CVR fc1 b1 | [1,128,256] | 11.03 | 4.43 | **2.5x** |
-| CVR embedding b4 | [4,256,1024] | 28.95 | 4.73 | **6.1x** |
-| LLM qkv b1 | [8,512,512] | 19.27 | 10.28 | **1.87x** |
-| BERT qkv b128 | [128,256,256] | 43.22 | 62.97 | 0.69x* |
-| **Overall Average** | - | **29.16** | **24.91** | **1.17x** |
+| CVR embedding b1 | [1,256,1024] | 11.65 | 4.43 | **2.6x** |
+| CVR embedding b4 | [4,256,1024] | 28.70 | 4.72 | **6.1x** |
+| LLM qkv b1 | [8,512,512] | 19.75 | 10.46 | **1.89x** |
+| LLM qkv b4 | [32,512,512] | 38.52 | 29.47 | **1.31x** |
+| BERT qkv b4 | [128,256,256] | 43.13 | 63.04 | 0.68x* |
+| **Overall Average** | - | **29.19** | **25.10** | **1.16x** |
 
-**\*Note:** Large-batch shapes (BERT b128, BERT b32) show upstream oneDNN faster because `gemm_driver` outperforms dnnopt's general kernel. Recommended fix: add fallback condition `M >= 64 || K >= 512` in `dnnopt_sgemm()` to route large shapes to upstream.
+**\*Note:** Large-M shapes (BERT b128, M≥128) show upstream oneDNN faster. However, oneDNN aarch64 lacks `gemm_driver` (only x64/ppc64 have it), so fallback to `ref_gemm` would be slower than dnnopt. TODO: integrate ACL gemm for large-M fallback or optimize dnnopt's large-M kernels.
 
 #### Apply dnnopt Integration (Optional)
 
