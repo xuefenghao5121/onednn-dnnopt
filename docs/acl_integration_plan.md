@@ -11,9 +11,26 @@ oneDNN aarch64 没有 `gemm_driver`（只有 x64/ppc64 有），导致大矩阵 
 - oneDNN 要求 ACL: **v52.4+** (需要 `CpuActivation.h` 等新 API)
 - oneDNN 的 `acl_eltwise.hpp` 等文件依赖 ACL 52.x 的新 experimental operators API
 
-**解决方案选择**：
-- 方案 A（完整 ACL）需要升级 ACL 到 52.x+，可能影响 TensorFlow 构建
-- 方案 D（优化 dnnopt）是最可行的路径，无外部依赖
+**解决方案**: 使用 oneDNN 内置的 **BRGEMM** (Batched Reduced GEMM) 作为 fallback
+
+### BRGEMM Fallback 方案 (已实现)
+
+oneDNN aarch64 有自己的 JIT-compiled brgemm kernel（使用 Xbyak_aarch64），无需 ACL：
+
+```cpp
+// brgemm_sgemm_wrapper.hpp
+brgemm_desc_init(&brg, isa_undef, brgemm_addr, f32, f32, ...);
+brgemm_kernel_create(&brg_kernel, brg);  // JIT 编译
+brgemm_kernel_execute(brg_kernel, 1, &batch, C);
+```
+
+**Dispatch 顺序**:
+1. **dnnopt**: 所有形状优先（小矩阵优化）
+2. **brgemm**: fallback 当 dnnopt 返回 unimplemented
+3. **ref_gemm**: 最慢的参考实现
+
+**当前状态**: brgemm 作为 fallback 已实现，但每次调用有 JIT 编译开销。
+kernel 缓存可改善重复调用性能。
 
 ## 现状分析
 
