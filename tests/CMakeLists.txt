@@ -22,6 +22,20 @@ if(DNNOPT_BUILD_TESTS)
         add_test(NAME test_cblas COMMAND test_cblas)
     endif()
 
+    # Benchmarks
+    if(DNNOPT_BUILD_BLAS)
+        add_executable(bench_tf_like_inference bench_tf_like_inference.cpp)
+        # Link against oneDNN for dnnl_sgemm comparison
+        target_include_directories(bench_tf_like_inference PRIVATE
+            /root/onednn-dnnopt/include
+            /root/onednn-dnnopt/build/include
+        )
+        target_link_libraries(bench_tf_like_inference PRIVATE
+            dnnopt_blas
+            /root/onednn-dnnopt/build/src/libdnnl.so.3
+        )
+    endif()
+
     # Convenience target
     add_custom_target(run_tests
         COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure -j${CMAKE_BUILD_PARALLEL_LEVEL}

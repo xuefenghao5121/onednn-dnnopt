@@ -206,9 +206,24 @@ bazel build --config=mkl_aarch64_threadpool --linkopt=-fuse-ld=lld ...
 | LLM qkv b8 | [8,512,512] | 12.40 | 20.49 | 1.65x |
 | LLM ffn2 b32 | [32,512,1376] | 37.95 | 46.10 | 1.21x |
 
+#### oneDNN + dnnopt Integration Test Results
+
+**Benchmark: bench_tf_like_dnnopt vs bench_tf_like_upstream** (via dnnl_sgemm API)
+
+| Model/Layer | Shape | dnnopt GF | upstream GF | Speedup |
+|-------------|-------|-----------|-------------|---------|
+| CVR embedding b1 | [1,256,1024] | 11.92 | 4.48 | **2.7x** |
+| CVR fc1 b1 | [1,128,256] | 11.03 | 4.43 | **2.5x** |
+| CVR embedding b4 | [4,256,1024] | 28.95 | 4.73 | **6.1x** |
+| LLM qkv b1 | [8,512,512] | 19.27 | 10.28 | **1.87x** |
+| BERT qkv b128 | [128,256,256] | 43.22 | 62.97 | 0.69x* |
+| **Overall Average** | - | **29.16** | **24.91** | **1.17x** |
+
+**\*Note:** Large-batch shapes (BERT b128, BERT b32) show upstream oneDNN faster because `gemm_driver` outperforms dnnopt's general kernel. Recommended fix: add fallback condition `M >= 64 || K >= 512` in `dnnopt_sgemm()` to route large shapes to upstream.
+
 #### Apply dnnopt Integration (Optional)
 
-To get additional dnnopt acceleration for small-M shapes (2.7-6.1x per standalone tests):
+To get additional dnnopt acceleration for small-M shapes:
 
 ```bash
 # After baseline build succeeds, apply dnnopt patch
