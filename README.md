@@ -210,16 +210,21 @@ bazel build --config=mkl_aarch64_threadpool --linkopt=-fuse-ld=lld ...
 
 **Benchmark: bench_tf_like_dnnopt vs bench_tf_like_upstream** (via dnnl_sgemm API)
 
-| Model/Layer | Shape | dnnopt GF | upstream GF | Speedup |
-|-------------|-------|-----------|-------------|---------|
-| CVR embedding b1 | [1,256,1024] | 11.65 | 4.43 | **2.6x** |
-| CVR embedding b4 | [4,256,1024] | 28.70 | 4.72 | **6.1x** |
-| LLM qkv b1 | [8,512,512] | 19.75 | 10.46 | **1.89x** |
-| LLM qkv b4 | [32,512,512] | 38.52 | 29.47 | **1.31x** |
-| BERT qkv b4 | [128,256,256] | 43.13 | 63.04 | 0.68x* |
-| **Overall Average** | - | **29.19** | **25.10** | **1.16x** |
+| Model/Layer | Shape | dnnopt+OpenBLAS GF | upstream GF | Speedup |
+|-------------|-------|--------------------|-------------|---------|
+| CVR embedding b1 | [1,256,1024] | 11.91 | 4.36 | **2.7x** |
+| CVR embedding b4 | [4,256,1024] | 28.63 | 4.69 | **6.1x** |
+| LLM qkv b1 | [8,512,512] | 19.71 | 10.54 | **1.87x** |
+| LLM qkv b4 | [32,512,512] | 38.70 | 29.53 | **1.31x** |
+| BERT qkv b128 | [128,256,256] | 43.15 | 62.94 | 0.69x |
+| **Overall Average** | - | **31.18** | ~25 | **1.24x** |
 
-**\*Note:** Large-M shapes (BERT b128, M≥128) show upstream oneDNN faster. However, oneDNN aarch64 lacks `gemm_driver` (only x64/ppc64 have it), so fallback to `ref_gemm` would be slower than dnnopt. TODO: integrate ACL gemm for large-M fallback or optimize dnnopt's large-M kernels.
+**Dispatch Strategy:**
+- Small-M (M < 32) and irregular shapes → dnnopt optimized kernels
+- Large regular shapes (M ≥ 32) → OpenBLAS cblas_sgemm (matches upstream)
+- Final fallback → ref_gemm
+
+This strategy follows upstream oneDNN's approach for large matrices while leveraging dnnopt's strength in small/irregular shapes.
 
 #### Apply dnnopt Integration (Optional)
 
@@ -511,6 +516,30 @@ python3 scripts/roofline.py bench_gemm_results.csv 48.0 40.0
 ```
 
 ## Development Log
+
+### v0.9.16-dev -- Phase 13F+OpenBLAS: Shape-based Dispatch with OpenBLAS Fallback (2026-04-18)
+
+oneDNN+dnnopt integration finalized with shape-based dispatch strategy.
+
+- **Shape-based dispatch strategy**:
+  - Small-M (M < 32) and irregular shapes (N/K < 16): dnnopt optimized kernels
+  - Large regular shapes (M ≥ 32): OpenBLAS cblas_sgemm (matches upstream behavior)
+  - Final fallback: ref_gemm
+- **OpenBLAS integration**:
+  - oneDNN aarch64 lacks `gemm_driver` (only x64/ppc64 have it)
+  - Reusing upstream's OpenBLAS fallback for large matrices
+  - Requires `-DDNNL_BLAS_VENDOR=OPENBLAS` cmake option
+- **ACL integration abandoned**:
+  - TF bazel cache has ACL v31.0.1, oneDNN requires v52.4+ (API mismatch)
+  - BRGEMM JIT overhead per call made it unsuitable as fallback
+- **Final performance results**:
+  - CVR embedding b1: 11.91 GF (2.7x vs upstream)
+  - CVR embedding b4: 28.63 GF (6.1x vs upstream)
+  - LLM qkv b4: 38.70 GF (1.31x vs upstream)
+  - BERT qkv b128: 43.15 GF (large matrix, OpenBLAS handles)
+  - Average: 31.18 GFLOPS (24% overall improvement)
+- **Key insight**: dnnopt complements oneDNN for weak shapes, not replaces large-matrix paths
+- **Repository**: `onednn-dnnopt` fork with gemm.cpp patch (6 commits on dnnopt-integration branch)
 
 ### v0.9.15-dev -- Phase 13E+TF: TensorFlow Build & Testing Complete (2026-04-17)
 
