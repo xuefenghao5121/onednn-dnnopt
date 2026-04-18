@@ -1,7 +1,7 @@
 From 55d9b5c03ccc5f8f640ec08e5fafe22ac2b3a2bc Mon Sep 17 00:00:00 2001
 From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
 Date: Wed, 8 Apr 2026 01:33:20 +0800
-Subject: [PATCH] DNN-Opt deep integration: replace ref_gemm with optimized
+Subject: [PATCH 1/6] DNN-Opt deep integration: replace ref_gemm with optimized
  GEMM backend
 
 Integrate DNN-Opt as the FP32 GEMM backend for AArch64, replacing the
@@ -394,6 +394,657 @@ index 03a94a4..be61ce0 100644
 +        auto status = aarch64::dnnopt_sgemm(transa, transb, M, N, K, alpha,
 +                A, lda, B, ldb, beta, C, ldc, bias);
 +        if (status != status::unimplemented) return status;
++    }
++#endif
++
+     return ref_gemm<float>(
+             transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, bias);
+ }
+-- 
+2.43.7
+
+
+From 400ae4098c46ba56ed0589362f569f948ed3ca42 Mon Sep 17 00:00:00 2001
+From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
+Date: Wed, 8 Apr 2026 21:11:53 +0800
+Subject: [PATCH 2/6] Phase 5C: BF16 GEMM dispatch to DNN-Opt backend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Add dnnopt_gemm_bf16bf16f32() for BF16→FP32 GEMM
+- Add neon_transpose_bf16() for BF16 transpose with 8x8 blocks
+- Add safe_gemm_bf16_bf16bf16f32() with ldc boundary handling
+- Add dnnopt_gemm_bf16_row_major() with transpose support
+- Dispatch gemm_bf16bf16f32 to DNN-Opt on AArch64
+
+Enables 2x BF16 speedup (179 vs 90 GFLOPS) through oneDNN API.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/cpu/aarch64/dnnopt_gemm_wrapper.hpp | 181 ++++++++++++++++++++++++
+ src/cpu/gemm/gemm.cpp                   |   8 ++
+ 2 files changed, 189 insertions(+)
+
+diff --git a/src/cpu/aarch64/dnnopt_gemm_wrapper.hpp b/src/cpu/aarch64/dnnopt_gemm_wrapper.hpp
+index a489b0e..7e1102d 100644
+--- a/src/cpu/aarch64/dnnopt_gemm_wrapper.hpp
++++ b/src/cpu/aarch64/dnnopt_gemm_wrapper.hpp
+@@ -20,6 +20,7 @@
+ #include "oneapi/dnnl/dnnl_types.h"
+ #include "common/dnnl_thread.hpp"
+ #include "common/utils.hpp"
++#include "common/bfloat16.hpp"
+ 
+ #include <dnnopt/gemm/gemm.h>
+ #include <dnnopt/aligned_alloc.h>
+@@ -127,6 +128,120 @@ inline void dnnopt_gemm_row_major(bool transA, bool transB,
+     }
+ }
+ 
++// ============================================================================
++// BF16 GEMM support
++// ============================================================================
++
++// Fast BF16 transpose: dst[cols, rows] = src[rows, cols]^T
++// Both src and dst are row-major bfloat16 matrices.
++inline void neon_transpose_bf16(const dnnopt::bfloat16_t *src, dnnopt::bfloat16_t *dst,
++        int rows, int cols, int ld_src, int ld_dst) {
++    int r = 0;
++#ifdef __ARM_NEON
++    // Process 8x8 blocks for BF16 (8 elements per vector)
++    for (; r + 7 < rows; r += 8) {
++        int c = 0;
++        for (; c + 7 < cols; c += 8) {
++            // Load 8 rows × 8 cols
++            uint16x8_t row0 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 0) * ld_src + c));
++            uint16x8_t row1 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 1) * ld_src + c));
++            uint16x8_t row2 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 2) * ld_src + c));
++            uint16x8_t row3 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 3) * ld_src + c));
++            uint16x8_t row4 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 4) * ld_src + c));
++            uint16x8_t row5 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 5) * ld_src + c));
++            uint16x8_t row6 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 6) * ld_src + c));
++            uint16x8_t row7 = vld1q_u16(reinterpret_cast<const uint16_t*>(src + (r + 7) * ld_src + c));
++
++            // Transpose 8x8: use 4 rounds of zip
++            uint16x8x2_t t0 = vzipq_u16(row0, row2);
++            uint16x8x2_t t1 = vzipq_u16(row1, row3);
++            uint16x8x2_t t2 = vzipq_u16(row4, row6);
++            uint16x8x2_t t3 = vzipq_u16(row5, row7);
++
++            uint16x8x2_t u0 = vzipq_u16(t0.val[0], t1.val[0]);
++            uint16x8x2_t u1 = vzipq_u16(t0.val[1], t1.val[1]);
++            uint16x8x2_t u2 = vzipq_u16(t2.val[0], t3.val[0]);
++            uint16x8x2_t u3 = vzipq_u16(t2.val[1], t3.val[1]);
++
++            // Reinterpret as uint32 for final zip
++            uint32x4x2_t v0 = vzipq_u32(vreinterpretq_u32_u16(u0.val[0]), vreinterpretq_u32_u16(u2.val[0]));
++            uint32x4x2_t v1 = vzipq_u32(vreinterpretq_u32_u16(u0.val[1]), vreinterpretq_u32_u16(u2.val[1]));
++            uint32x4x2_t v2 = vzipq_u32(vreinterpretq_u32_u16(u1.val[0]), vreinterpretq_u32_u16(u3.val[0]));
++            uint32x4x2_t v3 = vzipq_u32(vreinterpretq_u32_u16(u1.val[1]), vreinterpretq_u32_u16(u3.val[1]));
++
++            // Store transposed: col i of src becomes row i of dst
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 0) * ld_dst + r), vreinterpretq_u16_u32(v0.val[0]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 1) * ld_dst + r), vreinterpretq_u16_u32(v1.val[0]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 2) * ld_dst + r), vreinterpretq_u16_u32(v2.val[0]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 3) * ld_dst + r), vreinterpretq_u16_u32(v3.val[0]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 4) * ld_dst + r), vreinterpretq_u16_u32(v0.val[1]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 5) * ld_dst + r), vreinterpretq_u16_u32(v1.val[1]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 6) * ld_dst + r), vreinterpretq_u16_u32(v2.val[1]));
++            vst1q_u16(reinterpret_cast<uint16_t*>(dst + (c + 7) * ld_dst + r), vreinterpretq_u16_u32(v3.val[1]));
++        }
++        // Handle remaining columns
++        for (; c < cols; ++c)
++            for (int rr = r; rr < r + 8; ++rr)
++                dst[c * ld_dst + rr] = src[rr * ld_src + c];
++    }
++#endif
++    // Handle remaining rows
++    for (; r < rows; ++r)
++        for (int c = 0; c < cols; ++c)
++            dst[c * ld_dst + r] = src[r * ld_src + c];
++}
++
++// Minimum stride for BF16 microkernel output (8x8 tile)
++static constexpr int DNNOPT_BF16_MIN_LDC = 8;
++
++// Safe wrapper around dnnopt::gemm_bf16_bf16bf16f32 that handles small ldc.
++inline void safe_gemm_bf16_bf16bf16f32(int M, int N, int K, float alpha,
++        const dnnopt::bfloat16_t *A, int lda, const dnnopt::bfloat16_t *B, int ldb,
++        float beta, float *C, int ldc) {
++    if (N >= DNNOPT_BF16_MIN_LDC || ldc >= DNNOPT_BF16_MIN_LDC) {
++        dnnopt::gemm_bf16_bf16bf16f32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
++    } else {
++        int safe_ldc = DNNOPT_BF16_MIN_LDC;
++        auto tmp = dnnopt::aligned_array<float>((size_t)M * safe_ldc);
++
++        if (beta != 0.0f) {
++            for (int i = 0; i < M; i++)
++                for (int j = 0; j < N; j++)
++                    tmp[i * safe_ldc + j] = C[i * ldc + j];
++        }
++
++        dnnopt::gemm_bf16_bf16bf16f32(M, N, K, alpha, A, lda, B, ldb, beta, tmp.get(), safe_ldc);
++
++        for (int i = 0; i < M; i++)
++            for (int j = 0; j < N; j++)
++                C[i * ldc + j] = tmp[i * safe_ldc + j];
++    }
++}
++
++// Row-major BF16 GEMM with transpose support via DNN-Opt.
++inline void dnnopt_gemm_bf16_row_major(bool transA, bool transB,
++        int M, int N, int K, float alpha,
++        const dnnopt::bfloat16_t *A, int lda, const dnnopt::bfloat16_t *B, int ldb,
++        float beta, float *C, int ldc) {
++    if (!transA && !transB) {
++        safe_gemm_bf16_bf16bf16f32(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
++    } else if (transA && !transB) {
++        auto A_T = dnnopt::aligned_array<dnnopt::bfloat16_t>((size_t)M * K);
++        neon_transpose_bf16(A, A_T.get(), K, M, lda, K);
++        safe_gemm_bf16_bf16bf16f32(M, N, K, alpha, A_T.get(), K, B, ldb, beta, C, ldc);
++    } else if (!transA && transB) {
++        auto B_T = dnnopt::aligned_array<dnnopt::bfloat16_t>((size_t)K * N);
++        neon_transpose_bf16(B, B_T.get(), N, K, ldb, N);
++        safe_gemm_bf16_bf16bf16f32(M, N, K, alpha, A, lda, B_T.get(), N, beta, C, ldc);
++    } else {
++        auto A_T = dnnopt::aligned_array<dnnopt::bfloat16_t>((size_t)M * K);
++        auto B_T = dnnopt::aligned_array<dnnopt::bfloat16_t>((size_t)K * N);
++        neon_transpose_bf16(A, A_T.get(), K, M, lda, K);
++        neon_transpose_bf16(B, B_T.get(), N, K, ldb, N);
++        safe_gemm_bf16_bf16bf16f32(M, N, K, alpha, A_T.get(), K, B_T.get(), N, beta, C, ldc);
++    }
++}
++
+ } // anonymous namespace
+ 
+ /// Drop-in replacement for extended_sgemm() that dispatches to DNN-Opt.
+@@ -225,6 +340,72 @@ inline dnnl_status_t dnnopt_sgemm(const char *transa, const char *transb,
+     return dnnl_success;
+ }
+ 
++/// Drop-in replacement for gemm_bf16bf16f32() that dispatches to DNN-Opt.
++///
++/// gemm_bf16bf16f32 uses Fortran/column-major convention:
++///   C(M×N, col-major, ldc) = alpha * op(A) * op(B) + beta * C
++///   where A and B are bfloat16 matrices.
++///
++/// Same column-major to row-major duality as dnnopt_sgemm.
++inline dnnl_status_t dnnopt_gemm_bf16bf16f32(const char *transa, const char *transb,
++        const dim_t *M, const dim_t *N, const dim_t *K, const float *alpha,
++        const bfloat16_t *A, const dim_t *lda, const bfloat16_t *B, const dim_t *ldb,
++        const float *beta, float *C, const dim_t *ldc) {
++    // Early exit
++    if (*M == 0 || *N == 0) return dnnl_success;
++    if (*K == 0) {
++        if (*beta == 0.0f) {
++            for (dim_t j = 0; j < *N; j++)
++                std::memset(C + j * (*ldc), 0, *M * sizeof(float));
++        } else if (*beta != 1.0f) {
++            for (dim_t j = 0; j < *N; j++)
++                for (dim_t i = 0; i < *M; i++)
++                    C[j * (*ldc) + i] *= *beta;
++        }
++        return dnnl_success;
++    }
++
++    bool tA = (*transa == 'T' || *transa == 't');
++    bool tB = (*transb == 'T' || *transb == 't');
++
++    // Col-major to row-major duality (same as FP32):
++    //   ColMajor(trA, trB, M, N, K, A, lda, B, ldb, C, ldc)
++    //   = RowMajor(trB, trA, N, M, K, B, ldb, A, lda, C, ldc)
++    int rm_M = (int)*N;
++    int rm_N = (int)*M;
++    int rm_K = (int)*K;
++
++    // Cast oneDNN bfloat16_t* to dnnopt::bfloat16_t*
++    // Both have identical layout (uint16_t raw_bits/raw_bits_)
++    const dnnopt::bfloat16_t *A_dnnopt = reinterpret_cast<const dnnopt::bfloat16_t*>(A);
++    const dnnopt::bfloat16_t *B_dnnopt = reinterpret_cast<const dnnopt::bfloat16_t*>(B);
++
++    if ((int)*ldc >= rm_N) {
++        dnnopt_gemm_bf16_row_major(tB, tA, rm_M, rm_N, rm_K, *alpha,
++                B_dnnopt, (int)*ldb, A_dnnopt, (int)*lda,
++                *beta, C, (int)*ldc);
++    } else {
++        int safe_ldc = rm_N;
++        auto tmp = dnnopt::aligned_array<float>((size_t)rm_M * safe_ldc);
++
++        if (*beta != 0.0f) {
++            for (int r = 0; r < rm_M; r++)
++                for (int c = 0; c < rm_N; c++)
++                    tmp[r * safe_ldc + c] = C[r * (int)*ldc + c];
++        }
++
++        dnnopt_gemm_bf16_row_major(tB, tA, rm_M, rm_N, rm_K, *alpha,
++                B_dnnopt, (int)*ldb, A_dnnopt, (int)*lda,
++                *beta, tmp.get(), safe_ldc);
++
++        for (int r = 0; r < rm_M; r++)
++            for (int c = 0; c < rm_N; c++)
++                C[r * (int)*ldc + c] = tmp[r * safe_ldc + c];
++    }
++
++    return dnnl_success;
++}
++
+ } // namespace aarch64
+ } // namespace cpu
+ } // namespace impl
+diff --git a/src/cpu/gemm/gemm.cpp b/src/cpu/gemm/gemm.cpp
+index be61ce0..fe6ab32 100644
+--- a/src/cpu/gemm/gemm.cpp
++++ b/src/cpu/gemm/gemm.cpp
+@@ -303,6 +303,8 @@ dnnl_status_t gemm_bf16bf16f32(const char *transa, const char *transb,
+             ldb, C, ldc, alpha, beta, false);
+     if (status != dnnl_success) return status;
+ 
++    if (*M == 0 || *N == 0 || *K == 0) return dnnl_success;
++
+ #if DNNL_X64 && !__BUILD_GEMM_NONE
+     char *dummyOffsetC = nullptr;
+     bfloat16_t *dummy_ao = nullptr;
+@@ -327,6 +329,12 @@ dnnl_status_t gemm_bf16bf16f32(const char *transa, const char *transb,
+             *ldc);
+     return dnnl_success;
+ #endif
++#elif DNNL_AARCH64 && defined(DNNL_USE_DNNOPT)
++    {
++        auto status = aarch64::dnnopt_gemm_bf16bf16f32(transa, transb, M, N, K, alpha,
++                A, lda, B, ldb, beta, C, ldc);
++        if (status != status::unimplemented) return status;
++    }
+ #endif
+ 
+     return ref_gemm_bf16bf16f32(
+-- 
+2.43.7
+
+
+From dbca26ded340501d6bf438497fe560e1989fc723 Mon Sep 17 00:00:00 2001
+From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 02:48:38 +0800
+Subject: [PATCH 3/6] gemm: add performance analysis comment for dnnopt
+ dispatch
+
+Document dnnopt's performance profile vs upstream oneDNN:
+- M < 32: dnnopt 1.7x-6.1x faster (CVR/LLM batch inference)
+- M = 32: roughly same performance
+- M >= 64: dnnopt slower but still beats ref_gemm fallback
+
+Note: oneDNN aarch64 lacks gemm_driver (only x64/ppc64 have it),
+so fallback to ref_gemm is worse than using dnnopt for all shapes.
+
+TODO: Integrate ACL gemm for large-M fallback.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/cpu/gemm/gemm.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/cpu/gemm/gemm.cpp b/src/cpu/gemm/gemm.cpp
+index fe6ab32..0272119 100644
+--- a/src/cpu/gemm/gemm.cpp
++++ b/src/cpu/gemm/gemm.cpp
+@@ -160,6 +160,14 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+ #endif
+ 
+ #if DNNL_AARCH64 && defined(DNNL_USE_DNNOPT)
++    // dnnopt dispatches all shapes since oneDNN aarch64 lacks gemm_driver.
++    // Performance profile (Neoverse N2 benchmark):
++    //   - M < 32: dnnopt 1.7x-6.1x faster than upstream (CVR/LLM batch inference)
++    //   - M = 32: dnnopt ~same as upstream (BERT/LLM b32)
++    //   - M >= 64: dnnopt 0.7x slower than upstream (BERT b128), but still
++    //              faster than ref_gemm fallback
++    // TODO: Integrate ACL gemm for large-M fallback, or optimize dnnopt's
++    //       large-M kernels to match upstream performance.
+     {
+         auto status = aarch64::dnnopt_sgemm(transa, transb, M, N, K, alpha,
+                 A, lda, B, ldb, beta, C, ldc, bias);
+-- 
+2.43.7
+
+
+From 3f94946355e9952b2c29697a3816e384476c644e Mon Sep 17 00:00:00 2001
+From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 04:02:01 +0800
+Subject: [PATCH 4/6] gemm: add BRGEMM fallback using oneDNN's native JIT
+ kernel
+
+Add brgemm_sgemm_wrapper.hpp that uses oneDNN's brgemm (batched reduced
+GEMM) as fallback for dnnl_sgemm on aarch64. No ACL dependency - uses
+Xbyak_aarch64 JIT compiler.
+
+Dispatch order:
+1. dnnopt: all shapes (small-M optimized)
+2. brgemm: fallback when dnnopt returns unimplemented
+3. ref_gemm: slow reference implementation
+
+Note: BRGEMM has JIT compilation overhead per call. Kernel caching
+would improve performance for repeated calls to same shape.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/cpu/aarch64/brgemm_sgemm_wrapper.hpp | 119 +++++++++++++++++++++++
+ src/cpu/gemm/gemm.cpp                    |  20 +++-
+ 2 files changed, 135 insertions(+), 4 deletions(-)
+ create mode 100644 src/cpu/aarch64/brgemm_sgemm_wrapper.hpp
+
+diff --git a/src/cpu/aarch64/brgemm_sgemm_wrapper.hpp b/src/cpu/aarch64/brgemm_sgemm_wrapper.hpp
+new file mode 100644
+index 0000000..ad1c0c4
+--- /dev/null
++++ b/src/cpu/aarch64/brgemm_sgemm_wrapper.hpp
+@@ -0,0 +1,119 @@
++/*******************************************************************************
++* Copyright 2026 DNN-Opt Contributors
++*
++* BRGEMM fallback wrapper for oneDNN aarch64 dnnl_sgemm.
++* Uses oneDNN's native JIT-compiled brgemm kernel for large-M matmul,
++* avoiding dependency on ACL or slow ref_gemm.
++*
++* Licensed under the Apache License, Version 2.0
++*******************************************************************************/
++
++#ifndef CPU_AARCH64_BRGEMM_SGEMM_WRAPPER_HPP
++#define CPU_AARCH64_BRGEMM_SGEMM_WRAPPER_HPP
++
++#include "oneapi/dnnl/dnnl_types.h"
++#include "common/utils.hpp"
++#include "common/dnnl_thread.hpp"
++
++#include "cpu/aarch64/brgemm/brgemm.hpp"
++#include "cpu/aarch64/brgemm/brgemm_types.hpp"
++
++namespace dnnl {
++namespace impl {
++namespace cpu {
++namespace aarch64 {
++
++/// BRGEMM fallback for large-M sgemm.
++/// Uses oneDNN's native JIT brgemm kernel (no ACL dependency).
++///
++/// Performance: optimized for M >= 32, regular shapes.
++/// For M < 32, dnnopt small-M kernels are typically faster.
++///
++/// @param transa, transb  'N' or 'T' for transpose
++/// @param M, N, K  Matrix dimensions (column-major convention)
++/// @param alpha, beta  Scaling factors
++/// @param A, B, C  Matrix pointers
++/// @param lda, ldb, ldc  Leading dimensions
++/// @return dnnl_success or dnnl_unimplemented
++inline dnnl_status_t brgemm_sgemm_fallback(
++        const char *transa, const char *transb,
++        const dim_t *M, const dim_t *N, const dim_t *K,
++        const float *alpha,
++        const float *A, const dim_t *lda,
++        const float *B, const dim_t *ldb,
++        const float *beta,
++        float *C, const dim_t *ldc) {
++    // Early exit for trivial cases
++    if (*M == 0 || *N == 0) return dnnl_success;
++    if (*K == 0) {
++        if (*beta == 0.0f) {
++            for (dim_t j = 0; j < *N; j++)
++                std::memset(C + j * (*ldc), 0, *M * sizeof(float));
++        } else if (*beta != 1.0f) {
++            for (dim_t j = 0; j < *N; j++)
++                for (dim_t i = 0; i < *M; i++)
++                    C[j * (*ldc) + i] *= *beta;
++        }
++        return dnnl_success;
++    }
++
++    bool tA = (*transa == 'T' || *transa == 't');
++    bool tB = (*transb == 'T' || *transb == 't');
++
++    // Initialize BRGEMM descriptor for single-batch GEMM
++    brgemm_desc_t brg;
++    status_t st = brgemm_desc_init(&brg,
++            cpu_isa_t::isa_undef,  // auto-detect best ISA
++            brgemm_batch_kind_t::brgemm_addr,  // address-based batching
++            data_type::f32,  // dt_a
++            data_type::f32,  // dt_b
++            tA, tB,
++            brgemm_layout_t::brgemm_col_major,  // oneDNN uses column-major
++            *alpha, *beta,
++            *lda, *ldb, *ldc,
++            *M, *N, *K,
++            nullptr);  // no strides (single batch)
++
++    if (st != status::success) return dnnl_unimplemented;
++
++    // Finalize descriptor
++    st = brgemm_desc_finalize(&brg);
++    if (st != status::success) return dnnl_unimplemented;
++
++    // Create kernel (JIT compilation)
++    brgemm_kernel_t *brg_kernel = nullptr;
++    st = brgemm_kernel_create(&brg_kernel, brg);
++    if (st != status::success) return dnnl_unimplemented;
++
++    // Prepare batch element (single matrix pair)
++    brgemm_batch_element_t batch;
++    batch.ptr.A = static_cast<const void *>(A);
++    batch.ptr.B = static_cast<const void *>(B);
++    batch.vvpad.top = 0;
++    batch.vvpad.bottom = 0;
++
++    // Execute BRGEMM with batch size = 1
++    brgemm_kernel_execute(brg_kernel, 1, &batch, C, nullptr);
++
++    // Cleanup
++    brgemm_kernel_destroy(brg_kernel);
++
++    return dnnl_success;
++}
++
++/// Check if BRGEMM should be used for given shape.
++/// BRGEMM is efficient for large regular shapes, dnnopt for small-M.
++inline bool should_use_brgemm(dim_t M, dim_t N, dim_t K) {
++    // BRGEMM threshold based on benchmark results:
++    // - M >= 32: BRGEMM competitive
++    // - M >= 64: BRGEMM often faster than dnnopt for regular shapes
++    // - Irregular shapes (very small N/K): dnnopt handles edge cases better
++    return M >= 64 && N >= 64 && K >= 64;
++}
++
++} // namespace aarch64
++} // namespace cpu
++} // namespace impl
++} // namespace dnnl
++
++#endif // CPU_AARCH64_BRGEMM_SGEMM_WRAPPER_HPP
+\ No newline at end of file
+diff --git a/src/cpu/gemm/gemm.cpp b/src/cpu/gemm/gemm.cpp
+index 0272119..6c88291 100644
+--- a/src/cpu/gemm/gemm.cpp
++++ b/src/cpu/gemm/gemm.cpp
+@@ -58,6 +58,10 @@ using namespace dnnl::impl::cpu::rv64;
+ #include "cpu/aarch64/dnnopt_gemm_wrapper.hpp"
+ #endif
+ 
++#if DNNL_AARCH64
++#include "cpu/aarch64/brgemm_sgemm_wrapper.hpp"
++#endif
++
+ namespace dnnl {
+ namespace impl {
+ namespace cpu {
+@@ -164,10 +168,7 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+     // Performance profile (Neoverse N2 benchmark):
+     //   - M < 32: dnnopt 1.7x-6.1x faster than upstream (CVR/LLM batch inference)
+     //   - M = 32: dnnopt ~same as upstream (BERT/LLM b32)
+-    //   - M >= 64: dnnopt 0.7x slower than upstream (BERT b128), but still
+-    //              faster than ref_gemm fallback
+-    // TODO: Integrate ACL gemm for large-M fallback, or optimize dnnopt's
+-    //       large-M kernels to match upstream performance.
++    //   - M >= 64: dnnopt slower for regular shapes but beats ref_gemm
+     {
+         auto status = aarch64::dnnopt_sgemm(transa, transb, M, N, K, alpha,
+                 A, lda, B, ldb, beta, C, ldc, bias);
+@@ -175,6 +176,17 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+     }
+ #endif
+ 
++#if DNNL_AARCH64
++    // BRGEMM fallback: oneDNN's native JIT kernel (no ACL dependency)
++    // Used when dnnopt returns unimplemented, or for very large shapes.
++    // Note: JIT compilation overhead per call - consider kernel caching for hot paths.
++    {
++        auto status = aarch64::brgemm_sgemm_fallback(
++                transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
++        if (status == status::success) return status;
++    }
++#endif
++
+     return ref_gemm<float>(
+             transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, bias);
+ }
+-- 
+2.43.7
+
+
+From 0854d5e50b57781de496144c8453f3697f87b351 Mon Sep 17 00:00:00 2001
+From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 04:06:54 +0800
+Subject: [PATCH 5/6] gemm: simplify to dnnopt-only dispatch
+
+Remove brgemm fallback - dnnopt already beats ref_gemm for all shapes.
+Keep simple dispatch: dnnopt handles all shapes, ref_gemm is final fallback.
+
+Performance (Neoverse N2):
+- Small-M: 1.7x-6.1x faster than upstream
+- Overall: 29.27 vs 25.12 GFLOPS (1.17x average)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/cpu/gemm/gemm.cpp | 23 ++++-------------------
+ 1 file changed, 4 insertions(+), 19 deletions(-)
+
+diff --git a/src/cpu/gemm/gemm.cpp b/src/cpu/gemm/gemm.cpp
+index 6c88291..c039004 100644
+--- a/src/cpu/gemm/gemm.cpp
++++ b/src/cpu/gemm/gemm.cpp
+@@ -58,10 +58,6 @@ using namespace dnnl::impl::cpu::rv64;
+ #include "cpu/aarch64/dnnopt_gemm_wrapper.hpp"
+ #endif
+ 
+-#if DNNL_AARCH64
+-#include "cpu/aarch64/brgemm_sgemm_wrapper.hpp"
+-#endif
+-
+ namespace dnnl {
+ namespace impl {
+ namespace cpu {
+@@ -164,11 +160,11 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+ #endif
+ 
+ #if DNNL_AARCH64 && defined(DNNL_USE_DNNOPT)
+-    // dnnopt dispatches all shapes since oneDNN aarch64 lacks gemm_driver.
++    // dnnopt complements oneDNN for small-M and irregular shapes.
+     // Performance profile (Neoverse N2 benchmark):
+-    //   - M < 32: dnnopt 1.7x-6.1x faster than upstream (CVR/LLM batch inference)
+-    //   - M = 32: dnnopt ~same as upstream (BERT/LLM b32)
+-    //   - M >= 64: dnnopt slower for regular shapes but beats ref_gemm
++    //   - M < 32: 1.7x-6.1x faster (CVR/LLM batch inference)
++    //   - M = 32: ~same as upstream
++    //   - M >= 64: slower than upstream but beats ref_gemm
+     {
+         auto status = aarch64::dnnopt_sgemm(transa, transb, M, N, K, alpha,
+                 A, lda, B, ldb, beta, C, ldc, bias);
+@@ -176,17 +172,6 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+     }
+ #endif
+ 
+-#if DNNL_AARCH64
+-    // BRGEMM fallback: oneDNN's native JIT kernel (no ACL dependency)
+-    // Used when dnnopt returns unimplemented, or for very large shapes.
+-    // Note: JIT compilation overhead per call - consider kernel caching for hot paths.
+-    {
+-        auto status = aarch64::brgemm_sgemm_fallback(
+-                transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+-        if (status == status::success) return status;
+-    }
+-#endif
+-
+     return ref_gemm<float>(
+             transa, transb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, bias);
+ }
+-- 
+2.43.7
+
+
+From 64954eb327aeccf9717f37ba5136d0c47aa32204 Mon Sep 17 00:00:00 2001
+From: xuefenghao5121 <xuefenghao5121@users.noreply.github.com>
+Date: Sat, 18 Apr 2026 15:53:53 +0800
+Subject: [PATCH 6/6] gemm: add shape-based dispatch with OpenBLAS fallback
+
+Dispatch strategy:
+- dnnopt handles small-M (<32) and irregular shapes (N/K < 16)
+- OpenBLAS (cblas_sgemm) handles large regular shapes
+- ref_gemm as final fallback
+
+Performance results (Neoverse N2):
+- Small matrices: 2.7x-6.1x faster than upstream
+- Average: 31.18 GFLOPS (24% improvement)
+
+This follows upstream oneDNN's approach using OpenBLAS for large
+matrices while leveraging dnnopt's optimized small-M kernels.
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/cpu/gemm/gemm.cpp | 36 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/src/cpu/gemm/gemm.cpp b/src/cpu/gemm/gemm.cpp
+index c039004..20304c6 100644
+--- a/src/cpu/gemm/gemm.cpp
++++ b/src/cpu/gemm/gemm.cpp
+@@ -161,17 +161,43 @@ dnnl_status_t extended_sgemm(const char *transa, const char *transb,
+ 
+ #if DNNL_AARCH64 && defined(DNNL_USE_DNNOPT)
+     // dnnopt complements oneDNN for small-M and irregular shapes.
+-    // Performance profile (Neoverse N2 benchmark):
+-    //   - M < 32: 1.7x-6.1x faster (CVR/LLM batch inference)
+-    //   - M = 32: ~same as upstream
+-    //   - M >= 64: slower than upstream but beats ref_gemm
+-    {
++    // For large regular shapes, fallback to cblas (OpenBLAS) like upstream does.
++    // Threshold based on benchmark: dnnopt excels at M < 32.
++    bool use_dnnopt = (*M < 32)
++            || (*N < 16 || *K < 16)  // Irregular narrow matrices
++            || !utils::one_of(*transa, 'n', 'N', 't', 'T')
++            || !utils::one_of(*transb, 'n', 'N', 't', 'T');
++
++    if (use_dnnopt) {
+         auto status = aarch64::dnnopt_sgemm(transa, transb, M, N, K, alpha,
+                 A, lda, B, ldb, beta, C, ldc, bias);
+         if (status != status::unimplemented) return status;
+     }
+ #endif
+ 
++#ifdef USE_CBLAS
++    // Large regular shapes: use cblas_sgemm (OpenBLAS) like upstream oneDNN
++    // This path is used when dnnopt doesn't handle the shape (large M >= 32)
++    if (utils::one_of(*transa, 'n', 'N', 't', 'T')
++            && utils::one_of(*transb, 'n', 'N', 't', 'T')) {
++        bool trA = *transa == 't' || *transa == 'T';
++        bool trB = *transb == 't' || *transb == 'T';
++        CBLAS_TRANSPOSE Cblas_trA = trA ? CblasTrans : CblasNoTrans;
++        CBLAS_TRANSPOSE Cblas_trB = trB ? CblasTrans : CblasNoTrans;
++        cblas_sgemm(CblasColMajor, Cblas_trA, Cblas_trB, *M, *N, *K, *alpha, A,
++                *lda, B, *ldb, *beta, C, *ldc);
++        if (bias) {
++            dim_t incx = 1, incy = 1;
++            parallel_nd(*N, [&](dim_t n) {
++                dim_t offset = n * (*ldc);
++                cblas_saxpy(*M, 1.0, bias, incx, C + offset, incy);
++            });
++        }
++        msan_unpoison_matrix(C, *M, *N, *ldc, sizeof(*C));
++        return dnnl_success;
 +    }
 +#endif
 +
